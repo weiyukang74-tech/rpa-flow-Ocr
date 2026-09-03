@@ -1,9 +1,7 @@
-r"""在新 HIS 中按住院号查询，点击结果进入详情页并保存截图。
+r"""独立流程配置器使用的 HIS Windows 自动化适配器。
 
 运行方式（Windows CMD）：
-    cd /d D:\AI\AI_S\RPA_his
-    .venv-jab310\Scripts\activate
-    python his_enter_dump_first.py
+    python his_automation.py
 
 脚本只操作已经打开的“医院信息系统（HIS）”窗口：精确定位“住院号”
 输入框，写入 ZY26031245，按下 Enter，等待查询结果后点击首条结果。

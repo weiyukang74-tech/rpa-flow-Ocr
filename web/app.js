@@ -440,7 +440,7 @@ async function createConfig() {
     schemaVersion: 1,
     name,
     variables: { hospitalization_number: "ZY26031245" },
-    settings: { outputDir: "../output" },
+    settings: { outputDir: "output" },
     steps: [{
       id: newId(),
       type: "window.activate",

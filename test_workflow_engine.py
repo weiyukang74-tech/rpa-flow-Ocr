@@ -49,7 +49,7 @@ class WorkflowEngineTests(unittest.TestCase):
             config = {
                 "name": "测试流程",
                 "variables": {"value": "A"},
-                "settings": {"outputDir": "../output"},
+                "settings": {"outputDir": "output"},
                 "steps": [
                     {"id": "one", "type": "test.record", "params": {"value": "${value}"}},
                     {"id": "skip", "type": "test.record", "enabled": False, "params": {"value": "B"}},

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -10,12 +9,9 @@ from typing import Any
 from PIL import ImageGrab
 
 STUDIO_ROOT = Path(__file__).resolve().parent
-SCRATCH_ROOT = STUDIO_ROOT.parent
-if str(SCRATCH_ROOT) not in sys.path:
-    sys.path.insert(0, str(SCRATCH_ROOT))
 
-import his_enter_dump_first as his
-import his_enter_dump_first_ocr_mark as marker
+import his_automation as his
+import ocr_marker as marker
 from pywinauto import mouse
 from pywinauto.keyboard import send_keys
 

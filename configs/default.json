@@ -5,7 +5,7 @@
     "hospitalization_number": "ZY26"
   },
   "settings": {
-    "outputDir": "../output"
+    "outputDir": "output"
   },
   "steps": [
     {

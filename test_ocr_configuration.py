@@ -2,16 +2,9 @@
 
 from __future__ import annotations
 
-import sys
 import unittest
-from pathlib import Path
 
-
-SCRATCH_ROOT = Path(__file__).resolve().parent.parent
-if str(SCRATCH_ROOT) not in sys.path:
-    sys.path.insert(0, str(SCRATCH_ROOT))
-
-from his_enter_dump_first_ocr_mark import OcrItem, find_header_matches
+from ocr_marker import OcrItem, find_header_matches
 
 
 def item(text: str, left: int, top: int, width: int = 70) -> OcrItem:
@@ -68,4 +61,3 @@ class OcrConfigurationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -1,0 +1,6 @@
+mss>=9,<11
+onnxruntime>=1.17,<2
+openpyxl>=3.1,<4
+Pillow>=10,<13
+pywinauto>=0.6.8,<0.7
+rapidocr>=3.5,<4

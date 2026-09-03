@@ -1,6 +1,6 @@
-r"""运行 HIS 查询，并用 OCR 给指定医嘱列画红框。
+r"""独立流程配置器的 OCR 表格列标注模块。
 
-本文件是 ``his_enter_dump_first.py`` 的增强入口，不会修改或覆盖原脚本。
+本文件随流程配置器发布，不依赖 HIS 项目目录中的 Python 文件。
 执行顺序：
 
 1. 检查 HIS 窗口是否最大化，未最大化则先最大化；
@@ -24,7 +24,7 @@ from typing import Any, Iterable, Sequence
 
 from PIL import Image, ImageDraw
 
-import his_enter_dump_first as base
+import his_automation as base
 
 
 TARGET_HEADERS: tuple[str, ...] = (

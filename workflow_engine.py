@@ -194,15 +194,15 @@ class WorkflowRunner:
         variables = deepcopy(config.get("variables", {}))
         variables.update(runtime_variables or {})
         output_setting = str(
-            config.get("settings", {}).get("outputDir") or "../output"
+            config.get("settings", {}).get("outputDir") or "output"
         )
         output_dir = (self.studio_root / output_setting).resolve()
-        allowed_output_root = self.studio_root.parent.resolve()
+        allowed_output_root = self.studio_root
         try:
             output_dir.relative_to(allowed_output_root)
         except ValueError as exc:
             raise WorkflowValidationError(
-                f"输出目录必须位于 {allowed_output_root} 内"
+                f"输出目录必须位于独立项目目录 {allowed_output_root} 内"
             ) from exc
         output_dir.mkdir(parents=True, exist_ok=True)
 
