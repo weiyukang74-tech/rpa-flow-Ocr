@@ -512,12 +512,7 @@ function renderRun() {
   $("#save-button").disabled = active;
   $("#run-to-button").disabled = active || !state.selectedStepId;
 
-  if (["failed", "cancelled"].includes(run.status) && state.logCollapsed) {
-    state.logCollapsed = false;
-    $(".console-panel").classList.remove("collapsed");
-    $("#page-flow").classList.remove("log-collapsed");
-    $("#toggle-log-button").textContent = "收起日志";
-  }
+  // 日志展开状态完全由用户控制；轮询、失败和取消都不能自动弹开面板。
 
   const log = $("#run-log");
   if (state.hiddenLogs || !run.logs?.length) {

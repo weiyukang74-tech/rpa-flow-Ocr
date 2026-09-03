@@ -8,8 +8,10 @@ __pycache__/
 output/
 *.log
 
+# User-created workflow drafts may contain runtime hospital identifiers
+rpa-flow-studio/configs/workflow-*.json
+
 # Unrelated scratch projects/files
 artifact_verify/
 medicare-appeal-lab/
 新建 文本文档.txt
-
