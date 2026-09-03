@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "name": "标准-HIS住院号医嘱取证",
+  "variables": {
+    "hospitalization_number": "ZY26031245"
+  },
+  "settings": {
+    "outputDir": "../output"
+  },
+  "steps": [
+    {
+      "id": "standard-01-activate",
+      "type": "window.activate",
+      "name": "01 连接 HIS 窗口",
+      "enabled": true,
+      "params": { "windowTitle": "医院信息系统（HIS）" }
+    },
+    {
+      "id": "standard-02-maximize",
+      "type": "window.maximize",
+      "name": "02 最大化 HIS 窗口",
+      "enabled": true,
+      "params": { "layoutWaitSeconds": 0.6 }
+    },
+    {
+      "id": "standard-03-input",
+      "type": "his.input_hospitalization",
+      "name": "03 填写住院号并回车",
+      "enabled": true,
+      "params": { "value": "${hospitalization_number}" }
+    },
+    {
+      "id": "standard-04-wait-query",
+      "type": "his.wait_query",
+      "name": "04 等待患者查询结果",
+      "enabled": true,
+      "params": { "timeoutSeconds": 30 }
+    },
+    {
+      "id": "standard-05-click-result",
+      "type": "his.click_first_result",
+      "name": "05 点击第一条查询结果",
+      "enabled": true,
+      "params": { "row": 1 }
+    },
+    {
+      "id": "standard-06-wait-orders",
+      "type": "his.wait_navigation",
+      "name": "06 等待医嘱页面",
+      "enabled": true,
+      "params": { "timeoutSeconds": 30 }
+    },
+    {
+      "id": "standard-07-current",
+      "type": "capture.current",
+      "name": "07 截取当前位置",
+      "enabled": true,
+      "params": { "filePrefix": "his_inpatient_${hospitalization_number}" }
+    },
+    {
+      "id": "standard-08-rightmost",
+      "type": "capture.rightmost",
+      "name": "08 截取横向最右端",
+      "enabled": true,
+      "params": {
+        "filePrefix": "his_inpatient_${hospitalization_number}",
+        "restorePosition": true,
+        "layoutWaitSeconds": 0.5
+      }
+    },
+    {
+      "id": "standard-09-ocr",
+      "type": "ocr.mark_columns",
+      "name": "09 OCR 标注审核字段",
+      "enabled": true,
+      "params": {
+        "columns": [
+          "医嘱名称",
+          "单次剂量",
+          "剂量单位",
+          "频次",
+          "总量",
+          "总量单位"
+        ]
+      }
+    }
+  ]
+}

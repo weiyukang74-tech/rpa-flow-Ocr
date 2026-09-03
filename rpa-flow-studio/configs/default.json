@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "name": "住院患者医嘱取证",
+  "variables": {
+    "hospitalization_number": "ZY26"
+  },
+  "settings": {
+    "outputDir": "../output"
+  },
+  "steps": [
+    {
+      "id": "step-mtkyirov-op8pn",
+      "type": "window.activate",
+      "name": "连接窗口",
+      "enabled": true,
+      "params": {
+        "windowTitle": "医院信息系统（HIS）"
+      }
+    },
+    {
+      "id": "step-mtkzmcf2-9kd29",
+      "type": "his.input_field",
+      "name": "填写科室名",
+      "enabled": true,
+      "params": {
+        "fieldName": "科室",
+        "value": "消化内科",
+        "pressEnter": true,
+        "timeoutSeconds": 5
+      },
+      "templateId": "module-8ec5bbe6046d"
+    },
+    {
+      "id": "step-mtkzms31-60mf3",
+      "type": "his.wait_query",
+      "name": "等待患者查询结果",
+      "enabled": true,
+      "params": {
+        "timeoutSeconds": 30
+      }
+    },
+    {
+      "id": "step-mtkzmsvz-7jlv4",
+      "type": "his.click_first_result",
+      "name": "点击查询结果",
+      "enabled": true,
+      "params": {
+        "row": 1
+      }
+    },
+    {
+      "id": "step-mtkzmtqj-8ke5x",
+      "type": "his.wait_navigation",
+      "name": "等待医嘱页面",
+      "enabled": true,
+      "params": {
+        "timeoutSeconds": 30
+      }
+    },
+    {
+      "id": "step-mtkzmvfs-jkg33",
+      "type": "capture.current",
+      "name": "截取当前位置",
+      "enabled": true,
+      "params": {
+        "filePrefix": "his_inpatient_${hospitalization_number}"
+      }
+    },
+    {
+      "id": "step-mtkzmvwt-igpx4",
+      "type": "capture.rightmost",
+      "name": "截取横向最右端",
+      "enabled": true,
+      "params": {
+        "filePrefix": "his_inpatient_${hospitalization_number}",
+        "restorePosition": true,
+        "layoutWaitSeconds": 0.5
+      }
+    },
+    {
+      "id": "step-mtkzmwfz-ytm80",
+      "type": "ocr.mark_columns",
+      "name": "OCR 标注表格列",
+      "enabled": true,
+      "params": {
+        "columns": [
+          "医嘱名称",
+          "单次剂量",
+          "剂量单位",
+          "频次",
+          "总量",
+          "总量单位"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,556 @@
+"""Built-in modules that bridge JSON steps to the verified HIS RPA functions."""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+STUDIO_ROOT = Path(__file__).resolve().parent
+SCRATCH_ROOT = STUDIO_ROOT.parent
+if str(SCRATCH_ROOT) not in sys.path:
+    sys.path.insert(0, str(SCRATCH_ROOT))
+
+import his_enter_dump_first as his
+import his_enter_dump_first_ocr_mark as marker
+from pywinauto import mouse
+from pywinauto.keyboard import send_keys
+
+from workflow_engine import (
+    ExecutionContext,
+    ModuleDefinition,
+    WorkflowExecutionError,
+    WorkflowRegistry,
+)
+
+
+def field(
+    name: str,
+    label: str,
+    field_type: str,
+    default: Any,
+    **extra: Any,
+) -> dict[str, Any]:
+    result = {"name": name, "label": label, "type": field_type, "default": default}
+    result.update(extra)
+    return result
+
+
+def current_window(context: ExecutionContext) -> Any:
+    window = his.activate_his_window()
+    context.state["window"] = window
+    return window
+
+
+def run_window_activate(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    title = str(params.get("windowTitle") or his.WINDOW_TITLE).strip()
+    if not title:
+        raise WorkflowExecutionError("窗口标题不能为空")
+    his.WINDOW_TITLE = title
+    marker.base.WINDOW_TITLE = title
+    window = his.activate_his_window()
+    context.state["window"] = window
+    return {"windowTitle": title}
+
+
+def run_window_maximize(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    window = current_window(context)
+    try:
+        maximized = bool(window.is_maximized())
+    except Exception:
+        maximized = False
+    if not maximized:
+        window.maximize()
+        time.sleep(float(params.get("layoutWaitSeconds", 0.6)))
+        context.emit("info", "HIS 窗口已最大化", None)
+    else:
+        context.emit("info", "HIS 窗口已经是最大化状态", None)
+    return {"wasAlreadyMaximized": maximized}
+
+
+PATIENT_QUERY_GRID: dict[str, tuple[int, int]] = {
+    "卡号": (1, 2),
+    "登记号": (2, 2),
+    "姓名": (3, 2),
+    "性别": (4, 2),
+    "出生日期": (5, 2),
+    "身份证": (1, 3),
+    "住院号": (2, 3),
+    "科室": (3, 3),
+    "病区": (4, 3),
+    "医生": (5, 3),
+    "就诊号": (1, 4),
+    "诊断": (2, 4),
+    "年龄": (3, 4),
+}
+
+
+def find_his_edit_control(window: Any, field_name: str, timeout: float = 5.0) -> Any | None:
+    """Find one visible edit by its accessible field name."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            matches = [
+                item
+                for item in window.descendants(control_type="Edit")
+                if his.normalize_text(getattr(item.element_info, "name", ""))
+                == field_name
+                and item.is_visible()
+                and item.is_enabled()
+            ]
+        except Exception:
+            matches = []
+        if len(matches) == 1:
+            return matches[0]
+        time.sleep(0.2)
+    return None
+
+
+def patient_query_field_point(window: Any, field_name: str) -> tuple[int, int, float]:
+    """Calculate a configured patient-query field from the responsive grid."""
+
+    if field_name not in PATIENT_QUERY_GRID:
+        raise WorkflowExecutionError(
+            f"字段“{field_name}”没有可用的布局坐标，且 UIA 未识别到该控件"
+        )
+    column, row = PATIENT_QUERY_GRID[field_name]
+    hospitalization_x, hospitalization_y, scale = his.hospitalization_field_point(window)
+    rect = window.rectangle()
+    logical_width = (rect.right - rect.left) / scale
+    logical_height = (rect.bottom - rect.top) / scale
+
+    if logical_width <= 1500:
+        gap, fixed_action_width = 7, 78 * 2
+    else:
+        gap, fixed_action_width = 11, 84 * 2
+    grid_inner_width = logical_width - 20
+    flexible_column_width = (
+        grid_inner_width - fixed_action_width - gap * 7
+    ) / 6
+    column_step = (flexible_column_width + gap) * scale
+    row_step = (25 if logical_height <= 820 else 30) * scale
+
+    x = round(hospitalization_x + (column - 2) * column_step)
+    y = round(hospitalization_y + (row - 3) * row_step)
+    if not (rect.left < x < rect.right and rect.top < y < rect.bottom):
+        raise WorkflowExecutionError(f"字段“{field_name}”的坐标超出 HIS 窗口")
+    return x, y, scale
+
+
+def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    field_name = str(params.get("fieldName") or "").strip()
+    value = str(params.get("value") or "").strip()
+    timeout = float(params.get("timeoutSeconds", 5))
+    submit = bool(params.get("pressEnter", True))
+    if not field_name:
+        raise WorkflowExecutionError("目标字段名称不能为空")
+    if not value:
+        raise WorkflowExecutionError(f"字段“{field_name}”的填写内容不能为空")
+
+    window = current_window(context)
+    control = find_his_edit_control(window, field_name, timeout)
+    if control is not None:
+        control.click_input()
+        locator_mode = "uia-control"
+        rect = control.rectangle()
+        point = (
+            rect.left + (rect.right - rect.left) // 2,
+            rect.top + (rect.bottom - rect.top) // 2,
+        )
+    else:
+        x, y, _scale = patient_query_field_point(window, field_name)
+        mouse.click(button="left", coords=(x, y))
+        locator_mode = "responsive-grid"
+        point = (x, y)
+
+    time.sleep(0.15)
+    send_keys("^a", pause=0.06)
+    send_keys("{BACKSPACE}", pause=0.06)
+    send_keys(value, pause=0.08)
+    time.sleep(0.2)
+    if submit:
+        send_keys("{ENTER}", pause=0.08)
+    context.emit(
+        "info",
+        f"已填写 HIS 字段“{field_name}”{('并按回车' if submit else '')}；定位方式={locator_mode}",
+        None,
+    )
+    if field_name == "卡号" and his.HIS_URL.startswith("http://127.0.0.1:51321"):
+        context.emit(
+            "warning",
+            "当前模拟 HIS 的卡号输入框未接入患者查询条件；模块可完成填写，但 demo 不会按卡号过滤结果",
+            None,
+        )
+    return {
+        "fieldName": field_name,
+        "value": value,
+        "pressedEnter": submit,
+        "locatorMode": locator_mode,
+        "point": list(point),
+    }
+
+
+def run_his_input_number(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    number = str(params.get("value") or "").strip()
+    if not number:
+        raise WorkflowExecutionError("住院号不能为空")
+    his.HOSPITALIZATION_NUMBER = number
+    marker.base.HOSPITALIZATION_NUMBER = number
+    context.variables["hospitalization_number"] = number
+    window = current_window(context)
+    point, locator_mode = his.enter_hospitalization_number(window)
+    return {"value": number, "locatorMode": locator_mode, "point": list(point)}
+
+
+def run_his_wait_query(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    timeout = float(params.get("timeoutSeconds", 30))
+    client = his.HisApiClient(his.HIS_URL)
+    client.post("/api/session/bootstrap")
+    projection = client.get("/api/view")
+    if his.normalize_text((projection.get("session") or {}).get("status")) != "active":
+        client.post("/api/command", {"type": "session.login"})
+    deadline = time.monotonic() + timeout
+    last_query: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        context.check_cancelled()
+        projection = client.get("/api/view")
+        last_query = ((projection.get("query") or {}).get("patient") or {})
+        rows = projection.get("patientEncounterRows") or []
+        if (
+            his.normalize_text(last_query.get("hospitalizationNumber"))
+            == his.HOSPITALIZATION_NUMBER
+            and isinstance(rows, list)
+            and rows
+            and all(
+                his.normalize_text(row.get("hospitalizationNumber"))
+                == his.HOSPITALIZATION_NUMBER
+                for row in rows
+            )
+        ):
+            return {"rowCount": len(rows)}
+        context.wait(0.5)
+    raise WorkflowExecutionError(
+        f"{timeout:g} 秒内未等到住院号 {his.HOSPITALIZATION_NUMBER} 的查询结果；最后条件={last_query}"
+    )
+
+
+def run_his_click_result(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    row = int(params.get("row", 1))
+    if row != 1:
+        raise WorkflowExecutionError("当前模块只支持点击第 1 条结果")
+    locator_mode = his.click_query_result(current_window(context))
+    return {"row": row, "locatorMode": locator_mode}
+
+
+def run_his_wait_navigation(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    timeout = float(params.get("timeoutSeconds", 30))
+    client = his.HisApiClient(his.HIS_URL)
+    client.post("/api/session/bootstrap")
+    projection = client.get("/api/view")
+    if his.normalize_text((projection.get("session") or {}).get("status")) != "active":
+        client.post("/api/command", {"type": "session.login"})
+    deadline = time.monotonic() + timeout
+    last_selected: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        context.check_cancelled()
+        projection = client.get("/api/view")
+        selected = projection.get("selectedEncounter")
+        last_selected = selected if isinstance(selected, dict) else None
+        if (
+            last_selected is not None
+            and his.normalize_text(last_selected.get("hospitalizationNumber"))
+            == his.HOSPITALIZATION_NUMBER
+        ):
+            orders = projection.get("orders") or []
+            context.wait(0.8)
+            return {"orderCount": len(orders)}
+        context.wait(0.5)
+    raise WorkflowExecutionError(
+        f"{timeout:g} 秒内未进入住院号 {his.HOSPITALIZATION_NUMBER} 的医嘱页面；最后住院次={last_selected}"
+    )
+
+
+def safe_file_component(value: object) -> str:
+    text = str(value or "capture").strip()
+    cleaned = "".join(char if char.isalnum() or char in "-_" else "_" for char in text)
+    return cleaned[:100] or "capture"
+
+
+def run_capture_current(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    prefix = safe_file_component(
+        params.get("filePrefix")
+        or f"his_inpatient_{context.variables.get('hospitalization_number', 'unknown')}"
+    )
+    path = context.output_dir / f"{prefix}_current_{context.state['timestamp']}.png"
+    his.capture_his_window(current_window(context), path)
+    context.state["current_screenshot"] = path
+    context.state["screenshots"].append(path)
+    context.emit("info", f"当前位置截图：{path}", {"path": str(path)})
+    return {"path": str(path)}
+
+
+def run_capture_rightmost(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    current = context.state.get("current_screenshot")
+    if not isinstance(current, Path) or not current.is_file():
+        raise WorkflowExecutionError("请先执行“截取当前位置”模块")
+    window = current_window(context)
+    scrollbar = his.detect_horizontal_scrollbar(window, current)
+    if scrollbar is None:
+        context.emit("info", "未检测到横向滚动条，不生成最右端截图", None)
+        return {"captured": False}
+
+    original_position, rightmost_position = scrollbar
+    his.drag_scrollbar(original_position, rightmost_position)
+    prefix = safe_file_component(
+        params.get("filePrefix")
+        or f"his_inpatient_{context.variables.get('hospitalization_number', 'unknown')}"
+    )
+    path = context.output_dir / f"{prefix}_rightmost_{context.state['timestamp']}.png"
+    try:
+        time.sleep(float(params.get("layoutWaitSeconds", 0.5)))
+        his.capture_his_window(window, path)
+        context.state["screenshots"].append(path)
+        context.emit("info", f"最右端截图：{path}", {"path": str(path)})
+    finally:
+        if bool(params.get("restorePosition", True)) and path.is_file():
+            right_state = his.detect_horizontal_scrollbar(window, path)
+            if right_state is not None:
+                his.drag_scrollbar(right_state[0], original_position)
+                time.sleep(0.35)
+    return {"captured": True, "path": str(path)}
+
+
+def run_ocr_mark(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    columns = params.get("columns", list(marker.TARGET_HEADERS))
+    if isinstance(columns, str):
+        columns = [part.strip() for part in columns.split(",") if part.strip()]
+    if not isinstance(columns, list) or not all(isinstance(item, str) for item in columns):
+        raise WorkflowExecutionError("标注列名必须是字符串列表")
+    columns = list(dict.fromkeys(item.strip() for item in columns if item.strip()))
+    if not columns:
+        raise WorkflowExecutionError("至少需要配置一个标注列名")
+
+    screenshots = list(context.state.get("screenshots", []))
+    if not screenshots:
+        raise WorkflowExecutionError("没有可供 OCR 标注的截图")
+    engine = context.state.get("ocr_engine")
+    if engine is None:
+        engine = marker.create_ocr_engine()
+        context.state["ocr_engine"] = engine
+
+    all_found: set[str] = set()
+    outputs: list[str] = []
+    for screenshot in screenshots:
+        marked_path, found = marker.annotate_screenshot(engine, screenshot, columns)
+        context.state["marked_screenshots"].append(marked_path)
+        all_found.update(found)
+        outputs.append(str(marked_path))
+        context.emit(
+            "info",
+            f"标框截图：{marked_path}；识别字段：{', '.join(found) if found else '无'}",
+            {"path": str(marked_path), "found": found},
+        )
+
+    missing = [column for column in columns if column not in all_found]
+    if missing:
+        context.emit("warning", f"两张图中未找到：{', '.join(missing)}", None)
+    return {"paths": outputs, "found": sorted(all_found), "missing": missing}
+
+
+def run_wait(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    seconds = float(params.get("seconds", 1.0))
+    if not 0 <= seconds <= 120:
+        raise WorkflowExecutionError("等待时间必须在 0～120 秒之间")
+    context.wait(seconds)
+    return {"seconds": seconds}
+
+
+def run_keyboard(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    keys = str(params.get("keys") or "").strip()
+    if not keys or len(keys) > 100:
+        raise WorkflowExecutionError("按键内容不能为空且不能超过 100 个字符")
+    current_window(context).set_focus()
+    send_keys(keys, pause=float(params.get("pauseSeconds", 0.08)))
+    return {"keys": keys}
+
+
+def run_relative_click(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    x_ratio = float(params.get("xRatio", 0.5))
+    y_ratio = float(params.get("yRatio", 0.5))
+    if not 0 <= x_ratio <= 1 or not 0 <= y_ratio <= 1:
+        raise WorkflowExecutionError("相对坐标必须在 0～1 之间")
+    window = current_window(context)
+    rect = window.rectangle()
+    x = round(rect.left + (rect.right - rect.left) * x_ratio)
+    y = round(rect.top + (rect.bottom - rect.top) * y_ratio)
+    mouse.click(button=str(params.get("button") or "left"), coords=(x, y))
+    return {"point": [x, y]}
+
+
+def run_uia_click(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    name = str(params.get("name") or "").strip()
+    control_type = str(params.get("controlType") or "Button").strip()
+    timeout = float(params.get("timeoutSeconds", 5))
+    if not name:
+        raise WorkflowExecutionError("控件名称不能为空")
+    window = current_window(context)
+    control = window.child_window(
+        title=name,
+        control_type=control_type,
+    )
+    if not control.exists(timeout=timeout):
+        raise WorkflowExecutionError(f"未找到控件：{name} / {control_type}")
+    control.wrapper_object().click_input()
+    return {"name": name, "controlType": control_type}
+
+
+def build_registry() -> WorkflowRegistry:
+    registry = WorkflowRegistry()
+
+    definitions = [
+        ModuleDefinition(
+            "window.activate",
+            "连接窗口",
+            "窗口",
+            "按标题连接并激活目标 Windows 窗口。",
+            (field("windowTitle", "窗口标题", "text", "医院信息系统（HIS）"),),
+            run_window_activate,
+        ),
+        ModuleDefinition(
+            "window.maximize",
+            "最大化窗口",
+            "窗口",
+            "仅在窗口尚未最大化时执行最大化。",
+            (field("layoutWaitSeconds", "界面重排等待（秒）", "number", 0.6, min=0, max=10, step=0.1),),
+            run_window_maximize,
+        ),
+        ModuleDefinition(
+            "his.input_field",
+            "填写 HIS 字段并回车",
+            "HIS",
+            "字段名称和填写内容均可配置；优先 UIA，失败时按患者查询网格定位。",
+            (
+                field("fieldName", "目标字段名称", "text", "卡号"),
+                field("value", "填写内容/变量", "text", ""),
+                field("pressEnter", "填写后按回车", "boolean", True),
+                field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
+            ),
+            run_his_input_field,
+        ),
+        ModuleDefinition(
+            "his.input_hospitalization",
+            "填写住院号并回车",
+            "HIS",
+            "优先使用 UIA，失败时沿用已验证的相对布局定位。",
+            (field("value", "住院号/变量", "text", "${hospitalization_number}"),),
+            run_his_input_number,
+        ),
+        ModuleDefinition(
+            "his.wait_query",
+            "等待患者查询结果",
+            "HIS",
+            "等待页面确认住院号查询已经完成。",
+            (field("timeoutSeconds", "超时（秒）", "number", 30, min=1, max=180, step=1),),
+            run_his_wait_query,
+        ),
+        ModuleDefinition(
+            "his.click_first_result",
+            "点击查询结果",
+            "HIS",
+            "点击患者查询表中的第一条结果。",
+            (field("row", "结果序号", "number", 1, min=1, max=1, step=1),),
+            run_his_click_result,
+        ),
+        ModuleDefinition(
+            "his.wait_navigation",
+            "等待医嘱页面",
+            "HIS",
+            "确认已经进入目标住院次的医嘱费用查询页面。",
+            (field("timeoutSeconds", "超时（秒）", "number", 30, min=1, max=180, step=1),),
+            run_his_wait_navigation,
+        ),
+        ModuleDefinition(
+            "capture.current",
+            "截取当前位置",
+            "截图",
+            "截取当前 HIS 窗口并记录为 OCR 输入。",
+            (field("filePrefix", "文件名前缀", "text", "his_inpatient_${hospitalization_number}"),),
+            run_capture_current,
+        ),
+        ModuleDefinition(
+            "capture.rightmost",
+            "截取横向最右端",
+            "截图",
+            "检测横向滚动条，拖到最右端截图并恢复。",
+            (
+                field("filePrefix", "文件名前缀", "text", "his_inpatient_${hospitalization_number}"),
+                field("restorePosition", "截图后恢复", "boolean", True),
+                field("layoutWaitSeconds", "滚动后等待（秒）", "number", 0.5, min=0, max=10, step=0.1),
+            ),
+            run_capture_rightmost,
+        ),
+        ModuleDefinition(
+            "ocr.mark_columns",
+            "OCR 标注表格列",
+            "OCR",
+            "按表头文字定位并对可见数据列画红框。",
+            (
+                field(
+                    "columns",
+                    "目标列（每行一个）",
+                    "stringList",
+                    list(marker.TARGET_HEADERS),
+                ),
+            ),
+            run_ocr_mark,
+        ),
+        ModuleDefinition(
+            "utility.wait",
+            "等待",
+            "高级（可选）",
+            "在两个动作之间等待页面稳定。",
+            (field("seconds", "等待秒数", "number", 1, min=0, max=120, step=0.1),),
+            run_wait,
+        ),
+        ModuleDefinition(
+            "keyboard.send",
+            "发送按键",
+            "高级（可选）",
+            "向当前目标窗口发送 pywinauto 按键表达式。",
+            (
+                field("keys", "按键", "text", "{ENTER}"),
+                field("pauseSeconds", "按键间隔（秒）", "number", 0.08, min=0, max=2, step=0.01),
+            ),
+            run_keyboard,
+        ),
+        ModuleDefinition(
+            "mouse.click_relative",
+            "按窗口比例点击",
+            "高级（可选）",
+            "按目标窗口宽高比例点击，作为控件定位的兜底方式。",
+            (
+                field("xRatio", "横向比例", "number", 0.5, min=0, max=1, step=0.01),
+                field("yRatio", "纵向比例", "number", 0.5, min=0, max=1, step=0.01),
+                field("button", "鼠标键", "select", "left", options=["left", "right"]),
+            ),
+            run_relative_click,
+        ),
+        ModuleDefinition(
+            "uia.click",
+            "点击 UIA 控件",
+            "高级（可选）",
+            "按控件名称与类型定位并点击。",
+            (
+                field("name", "控件名称", "text", ""),
+                field("controlType", "控件类型", "text", "Button"),
+                field("timeoutSeconds", "超时（秒）", "number", 5, min=1, max=60, step=1),
+            ),
+            run_uia_click,
+        ),
+    ]
+    for definition in definitions:
+        registry.register(definition)
+    return registry

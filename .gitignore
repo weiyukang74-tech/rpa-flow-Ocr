@@ -1,0 +1,15 @@
+# Python caches and local runtime files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pycache/
+
+# Runtime evidence and logs (may contain hospital data)
+output/
+*.log
+
+# Unrelated scratch projects/files
+artifact_verify/
+medicare-appeal-lab/
+新建 文本文档.txt
+

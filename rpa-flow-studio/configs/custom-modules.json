@@ -1,0 +1,26 @@
+[
+  {
+    "id": "module-d84e65af33ff",
+    "name": "填写卡号",
+    "description": "",
+    "baseType": "his.input_field",
+    "params": {
+      "fieldName": "卡号",
+      "value": "1234",
+      "pressEnter": true,
+      "timeoutSeconds": 5
+    }
+  },
+  {
+    "id": "module-8ec5bbe6046d",
+    "name": "填写科室名",
+    "description": "",
+    "baseType": "his.input_field",
+    "params": {
+      "fieldName": "科室",
+      "value": "消化科室",
+      "pressEnter": true,
+      "timeoutSeconds": 5
+    }
+  }
+]

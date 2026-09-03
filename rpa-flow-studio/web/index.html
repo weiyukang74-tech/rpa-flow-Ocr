@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>流程配置器</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark">流</div>
+        <div>
+          <h1>流程配置器</h1>
+          <p>Windows 桌面任务 · 本机执行</p>
+        </div>
+      </div>
+      <div class="toolbar">
+        <label class="workflow-name">
+          <span>任务名称</span>
+          <input id="workflow-name" autocomplete="off" />
+        </label>
+        <button id="reload-button" class="button ghost">重新加载</button>
+        <button id="save-button" class="button secondary">保存配置</button>
+        <button id="run-button" class="button primary">运行任务</button>
+        <button id="cancel-run-button" class="button danger" hidden>取消任务</button>
+      </div>
+    </header>
+
+    <div id="status-strip" class="status-strip idle">
+      <span class="status-dot"></span>
+      <span id="status-text">Agent 已连接，当前空闲</span>
+      <span class="local-only">仅监听 127.0.0.1</span>
+    </div>
+
+    <nav class="page-tabs" aria-label="主导航">
+      <button class="page-tab active" data-page="flow">流程编排</button>
+      <button class="page-tab" data-page="configs">配置页</button>
+    </nav>
+
+    <div id="page-flow" class="app-page active">
+    <main class="workspace">
+      <aside class="panel palette-panel">
+        <div class="panel-title">
+          <div>
+            <span class="eyebrow">MODULES</span>
+            <h2>操作模块</h2>
+          </div>
+          <div class="title-actions">
+            <span id="module-count" class="count-pill">0</span>
+            <button id="new-module-button" class="mini-button">＋ 新增</button>
+          </div>
+        </div>
+        <p class="panel-help">点击模块添加到流程末尾。</p>
+        <div id="module-palette" class="module-palette"></div>
+      </aside>
+
+      <section class="panel flow-panel">
+        <div class="panel-title flow-title">
+          <div>
+            <span class="eyebrow">WORKFLOW</span>
+            <h2>流程编排</h2>
+          </div>
+          <div class="quick-variable">
+            <label for="hospitalization-number">本次住院号</label>
+            <input id="hospitalization-number" autocomplete="off" />
+          </div>
+        </div>
+        <div class="flow-note">
+          拖动步骤调整顺序。运行过程中请保持 HIS 可见，不要锁屏或操作鼠标键盘。
+        </div>
+        <div id="flow-list" class="flow-list"></div>
+        <button id="add-hint" class="empty-add" hidden>从左侧添加第一个模块</button>
+      </section>
+
+      <aside class="panel inspector-panel">
+        <div class="panel-title">
+          <div>
+            <span class="eyebrow">PROPERTIES</span>
+            <h2>模块参数</h2>
+          </div>
+        </div>
+        <div id="inspector" class="inspector"></div>
+      </aside>
+    </main>
+
+    <section class="console-panel">
+      <div class="console-header">
+        <div>
+          <span class="eyebrow">RUN LOG</span>
+          <strong>运行日志</strong>
+        </div>
+        <div class="console-actions">
+          <button id="run-to-button" class="text-button" disabled>运行到选中步骤</button>
+          <button id="toggle-log-button" class="text-button">收起日志</button>
+          <button id="clear-log-button" class="text-button">清空显示</button>
+        </div>
+      </div>
+      <div id="run-log" class="run-log">
+        <div class="log-placeholder">尚未运行任务</div>
+      </div>
+      <div id="run-result" class="run-result" hidden></div>
+    </section>
+    </div>
+
+    <section id="page-configs" class="app-page config-page">
+      <div class="config-page-header">
+        <div>
+          <span class="eyebrow">CONFIGURATIONS</span>
+          <h2>配置页</h2>
+          <p>管理所有已保存的流程配置。可以新建、载入修改或删除。</p>
+        </div>
+        <button id="new-config-button" class="button primary blue">＋ 新建配置</button>
+      </div>
+      <div id="config-list" class="config-grid"></div>
+      <div class="custom-library-header">
+        <div>
+          <span class="eyebrow">CUSTOM MODULES</span>
+          <h2>自定义操作模块</h2>
+          <p>基于已有安全动作创建可重复使用的模块模板。</p>
+        </div>
+        <button id="new-module-config-button" class="button secondary blue-outline">＋ 新增模块</button>
+      </div>
+      <div id="custom-module-list" class="custom-module-grid"></div>
+    </section>
+
+    <dialog id="module-dialog" class="editor-dialog">
+      <form method="dialog" id="module-form">
+        <div class="dialog-header">
+          <div><span class="eyebrow">CUSTOM MODULE</span><h2>新增操作模块</h2></div>
+          <button type="button" class="dialog-close cancel-dialog" aria-label="关闭">×</button>
+        </div>
+        <label class="form-field"><span>模块名称</span><input id="custom-module-name" type="text" required maxlength="80" /></label>
+        <label class="form-field"><span>基于动作</span><select id="custom-module-base"></select></label>
+        <label class="form-field"><span>模块说明</span><input id="custom-module-description" type="text" maxlength="300" /></label>
+        <div class="dialog-subtitle">默认参数</div>
+        <div id="custom-module-fields"></div>
+        <div class="dialog-actions">
+          <button type="button" class="button ghost-dark cancel-dialog">取消</button>
+          <button id="save-module-button" type="submit" class="button primary blue">保存模块</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="config-dialog" class="editor-dialog small-dialog">
+      <form method="dialog" id="config-form">
+        <div class="dialog-header">
+          <div><span class="eyebrow">NEW CONFIG</span><h2>新建配置</h2></div>
+          <button type="button" class="dialog-close cancel-dialog" aria-label="关闭">×</button>
+        </div>
+        <label class="form-field"><span>配置名称</span><input id="new-config-name" type="text" required maxlength="80" /></label>
+        <label class="checkbox-field"><input id="clone-current-config" type="checkbox" checked />复制当前流程中的步骤</label>
+        <div class="dialog-actions">
+          <button type="button" class="button ghost-dark cancel-dialog">取消</button>
+          <button id="create-config-button" type="submit" class="button primary blue">创建并编辑</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
