@@ -192,10 +192,6 @@ button { cursor: pointer; }
 
 .flow-panel { position: relative; display: flex; flex-direction: column; }
 .flow-title { flex: 0 0 auto; }
-.quick-variable { display: grid; grid-template-columns: auto 180px; gap: 8px; align-items: center; }
-.quick-variable label { color: var(--muted); font-size: 11px; }
-.quick-variable input { height: 33px; padding: 0 9px; border: 1px solid var(--line); border-radius: 6px; outline: none; }
-.quick-variable input:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(8,127,195,.1); }
 .flow-note { flex: 0 0 auto; padding: 9px 16px; color: #7a6470; background: #fff9ed; border-bottom: 1px solid #f0e6cf; font-size: 11px; }
 .flow-list { flex: 1 1 auto; padding: 16px 22px 30px; overflow: auto; background-image: radial-gradient(#dce5ef 1px, transparent 1px); background-size: 18px 18px; }
 

@@ -267,13 +267,10 @@ function renderInspector() {
 
 function syncHeaderInputs() {
   $("#workflow-name").value = state.config.name || "";
-  $("#hospitalization-number").value = state.config.variables?.hospitalization_number || "";
 }
 
 function readHeaderInputs() {
   state.config.name = $("#workflow-name").value.trim();
-  state.config.variables ||= {};
-  state.config.variables.hospitalization_number = $("#hospitalization-number").value.trim();
 }
 
 async function saveConfig() {
@@ -574,7 +571,6 @@ async function init() {
   }
 
   $("#workflow-name").addEventListener("input", () => { state.config.name = $("#workflow-name").value; });
-  $("#hospitalization-number").addEventListener("input", () => { state.config.variables.hospitalization_number = $("#hospitalization-number").value; });
   $("#save-button").addEventListener("click", () => saveConfig().catch((error) => showToast(error.message, true)));
   $("#reload-button").addEventListener("click", () => reloadConfig().catch((error) => showToast(error.message, true)));
   $("#run-button").addEventListener("click", () => startRun().catch((error) => showToast(error.message, true)));

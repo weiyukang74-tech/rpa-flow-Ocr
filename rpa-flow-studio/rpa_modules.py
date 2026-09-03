@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from PIL import ImageGrab
 
 STUDIO_ROOT = Path(__file__).resolve().parent
 SCRATCH_ROOT = STUDIO_ROOT.parent
@@ -71,6 +72,7 @@ def run_window_maximize(context: ExecutionContext, params: dict[str, Any]) -> di
 
 
 PATIENT_QUERY_GRID: dict[str, tuple[int, int]] = {
+    "卡类型": (5, 1),
     "卡号": (1, 2),
     "登记号": (2, 2),
     "姓名": (3, 2),
@@ -84,6 +86,21 @@ PATIENT_QUERY_GRID: dict[str, tuple[int, int]] = {
     "就诊号": (1, 4),
     "诊断": (2, 4),
     "年龄": (3, 4),
+    "病历": (4, 4),
+}
+
+PATIENT_QUERY_ACTIONS: dict[str, tuple[int, int]] = {
+    "读卡": (1, 1),
+    "打印": (2, 1),
+    "查询": (1, 2),
+    "导出": (2, 2),
+    "清屏": (1, 3),
+}
+
+PATIENT_QUERY_CHECKBOXES: dict[str, int] = {
+    "门急诊患者": 1,
+    "住院患者": 2,
+    "出院患者": 3,
 }
 
 
@@ -107,6 +124,66 @@ def find_his_edit_control(window: Any, field_name: str, timeout: float = 5.0) ->
             return matches[0]
         time.sleep(0.2)
     return None
+
+
+def find_named_his_control(
+    window: Any,
+    name: str,
+    control_types: set[str] | None,
+    timeout: float,
+    contains: bool = False,
+) -> Any | None:
+    """Find a visible HIS control by accessible name and optional control types."""
+
+    target = his.normalize_text(name)
+    deadline = time.monotonic() + max(0, timeout)
+    while True:
+        try:
+            matches: list[Any] = []
+            for item in window.descendants():
+                item_name = his.normalize_text(getattr(item.element_info, "name", ""))
+                item_type = str(getattr(item.element_info, "control_type", "") or "")
+                name_matches = target in item_name if contains else item_name == target
+                if (
+                    name_matches
+                    and (not control_types or item_type in control_types)
+                    and item.is_visible()
+                    and item.is_enabled()
+                ):
+                    matches.append(item)
+        except Exception:
+            matches = []
+        if matches:
+            type_priority = {
+                "Button": 0,
+                "CheckBox": 0,
+                "ComboBox": 0,
+                "Hyperlink": 1,
+                "TabItem": 1,
+                "MenuItem": 1,
+                "DataItem": 2,
+                "ListItem": 2,
+                "Text": 3,
+            }
+            return min(
+                matches,
+                key=lambda item: (
+                    type_priority.get(
+                        str(getattr(item.element_info, "control_type", "") or ""), 9
+                    ),
+                    item.rectangle().top,
+                    item.rectangle().left,
+                ),
+            )
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.2)
+
+
+def patient_query_row_step(window: Any, scale: float) -> float:
+    rect = window.rectangle()
+    logical_height = (rect.bottom - rect.top) / scale
+    return (25 if logical_height <= 820 else 30) * scale
 
 
 def patient_query_field_point(window: Any, field_name: str) -> tuple[int, int, float]:
@@ -138,6 +215,56 @@ def patient_query_field_point(window: Any, field_name: str) -> tuple[int, int, f
     if not (rect.left < x < rect.right and rect.top < y < rect.bottom):
         raise WorkflowExecutionError(f"字段“{field_name}”的坐标超出 HIS 窗口")
     return x, y, scale
+
+
+def patient_query_action_point(window: Any, action_name: str) -> tuple[int, int]:
+    """Locate the five standard action buttons in the patient query panel."""
+
+    if action_name not in PATIENT_QUERY_ACTIONS:
+        raise WorkflowExecutionError(
+            f"对象“{action_name}”未被 UIA 识别，也没有可用的患者查询布局坐标"
+        )
+    action_column, action_row = PATIENT_QUERY_ACTIONS[action_name]
+    _hospitalization_x, hospitalization_y, scale = patient_query_field_point(
+        window, "住院号"
+    )
+    rect = window.rectangle()
+    x_offset = 180 if action_column == 1 else 70
+    x = round(rect.right - x_offset * scale)
+    y = round(hospitalization_y + (action_row - 3) * patient_query_row_step(window, scale))
+    return x, y
+
+
+def patient_query_checkbox_point(window: Any, checkbox_name: str) -> tuple[int, int]:
+    """Locate a patient-type checkbox beside the patient query form."""
+
+    if checkbox_name not in PATIENT_QUERY_CHECKBOXES:
+        raise WorkflowExecutionError(
+            f"勾选框“{checkbox_name}”未被 UIA 识别，也没有可用的布局坐标"
+        )
+    row = PATIENT_QUERY_CHECKBOXES[checkbox_name]
+    _hospitalization_x, hospitalization_y, scale = patient_query_field_point(
+        window, "住院号"
+    )
+    rect = window.rectangle()
+    width = rect.right - rect.left
+    x = round(rect.left + width * 0.739)
+    y = round(hospitalization_y + (row - 3) * patient_query_row_step(window, scale))
+    return x, y
+
+
+def visual_checkbox_state(point: tuple[int, int]) -> bool:
+    """Detect the HIS blue checked state around a fallback checkbox point."""
+
+    x, y = point
+    with ImageGrab.grab(bbox=(x - 9, y - 9, x + 10, y + 10)) as image:
+        rgb = image.convert("RGB")
+        blue_pixels = sum(
+            1
+            for red, green, blue in rgb.getdata()
+            if red < 100 and green > 80 and blue > 130 and blue > red + 60
+        )
+    return blue_pixels >= 18
 
 
 def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
@@ -188,6 +315,158 @@ def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> di
         "fieldName": field_name,
         "value": value,
         "pressedEnter": submit,
+        "locatorMode": locator_mode,
+        "point": list(point),
+    }
+
+
+def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    field_name = str(params.get("fieldName") or "").strip()
+    option_text = str(params.get("optionText") or "").strip()
+    timeout = float(params.get("timeoutSeconds", 5))
+    if not field_name:
+        raise WorkflowExecutionError("下拉框字段名称不能为空")
+    if not option_text:
+        raise WorkflowExecutionError(f"下拉框“{field_name}”的目标选项不能为空")
+
+    window = current_window(context)
+    control = find_named_his_control(window, field_name, {"ComboBox"}, timeout)
+    if control is not None:
+        try:
+            control.select(option_text)
+        except Exception:
+            control.click_input()
+            send_keys("{HOME}", pause=0.06)
+            send_keys(option_text, pause=0.08)
+            send_keys("{ENTER}", pause=0.06)
+        locator_mode = "uia-control"
+        rect = control.rectangle()
+        point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
+    else:
+        x, y, _scale = patient_query_field_point(window, field_name)
+        mouse.click(button="left", coords=(x, y))
+        send_keys("{HOME}", pause=0.06)
+        send_keys(option_text, pause=0.08)
+        send_keys("{ENTER}", pause=0.06)
+        locator_mode = "responsive-grid"
+        point = (x, y)
+
+    context.emit(
+        "info",
+        f"已在下拉框“{field_name}”选择“{option_text}”；定位方式={locator_mode}",
+        None,
+    )
+    return {
+        "fieldName": field_name,
+        "optionText": option_text,
+        "locatorMode": locator_mode,
+        "point": list(point),
+    }
+
+
+def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    checkbox_name = str(params.get("checkboxName") or "").strip()
+    target_state = str(params.get("targetState") or "勾选").strip()
+    timeout = float(params.get("timeoutSeconds", 5))
+    if not checkbox_name:
+        raise WorkflowExecutionError("勾选框名称不能为空")
+    if target_state not in {"勾选", "取消勾选", "切换"}:
+        raise WorkflowExecutionError("勾选框目标状态无效")
+
+    window = current_window(context)
+    control = find_named_his_control(window, checkbox_name, {"CheckBox"}, timeout)
+    if control is not None:
+        try:
+            current_state = bool(control.get_toggle_state())
+        except Exception:
+            current_state = bool(control.iface_toggle.CurrentToggleState)
+        rect = control.rectangle()
+        point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
+        locator_mode = "uia-control"
+        should_click = (
+            target_state == "切换"
+            or (target_state == "勾选" and not current_state)
+            or (target_state == "取消勾选" and current_state)
+        )
+        if should_click:
+            control.click_input()
+    else:
+        point = patient_query_checkbox_point(window, checkbox_name)
+        current_state = visual_checkbox_state(point)
+        locator_mode = "visual-responsive-grid"
+        should_click = (
+            target_state == "切换"
+            or (target_state == "勾选" and not current_state)
+            or (target_state == "取消勾选" and current_state)
+        )
+        if should_click:
+            mouse.click(button="left", coords=point)
+
+    final_state = not current_state if should_click else current_state
+    context.emit(
+        "info",
+        f"勾选框“{checkbox_name}”已设为{('勾选' if final_state else '未勾选')}；定位方式={locator_mode}",
+        None,
+    )
+    return {
+        "checkboxName": checkbox_name,
+        "targetState": target_state,
+        "finalChecked": final_state,
+        "clicked": should_click,
+        "locatorMode": locator_mode,
+        "point": list(point),
+    }
+
+
+def run_his_click_object(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    target_name = str(params.get("targetName") or "").strip()
+    control_type = str(params.get("controlType") or "自动").strip()
+    match_mode = str(params.get("matchMode") or "精确匹配").strip()
+    timeout = float(params.get("timeoutSeconds", 5))
+    if not target_name:
+        raise WorkflowExecutionError("点击对象名称不能为空")
+    allowed_types = {
+        "Button",
+        "Hyperlink",
+        "TabItem",
+        "MenuItem",
+        "Text",
+        "DataItem",
+        "ListItem",
+    }
+    if control_type != "自动" and control_type not in allowed_types:
+        raise WorkflowExecutionError("点击对象控件类型无效")
+    if match_mode not in {"精确匹配", "包含文字"}:
+        raise WorkflowExecutionError("点击对象匹配方式无效")
+
+    window = current_window(context)
+    control_types = allowed_types if control_type == "自动" else {control_type}
+    control = find_named_his_control(
+        window,
+        target_name,
+        control_types,
+        timeout,
+        contains=match_mode == "包含文字",
+    )
+    if control is not None:
+        control.click_input()
+        rect = control.rectangle()
+        point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
+        locator_mode = "uia-control"
+    else:
+        point = patient_query_action_point(window, target_name)
+        mouse.click(button="left", coords=point)
+        locator_mode = "responsive-grid"
+
+    context.emit(
+        "info",
+        f"已点击 HIS 对象“{target_name}”；定位方式={locator_mode}",
+        None,
+    )
+    return {
+        "targetName": target_name,
+        "controlType": control_type,
+        "matchMode": match_mode,
         "locatorMode": locator_mode,
         "point": list(point),
     }
@@ -474,6 +753,70 @@ def build_registry() -> WorkflowRegistry:
                 field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
             ),
             run_his_input_field,
+        ),
+        ModuleDefinition(
+            "his.select_option",
+            "HIS 选择下拉项",
+            "HIS",
+            "字段名称和目标选项均可配置；优先按 ComboBox 控件定位。",
+            (
+                field("fieldName", "下拉框字段名称", "text", "性别"),
+                field("optionText", "选择内容/变量", "text", "全部"),
+                field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
+            ),
+            run_his_select_option,
+        ),
+        ModuleDefinition(
+            "his.set_checkbox",
+            "HIS 设置勾选框",
+            "HIS",
+            "按名称设置勾选或取消勾选；执行前读取当前状态，避免错误反选。",
+            (
+                field("checkboxName", "勾选框名称", "text", "出院患者"),
+                field(
+                    "targetState",
+                    "目标状态",
+                    "select",
+                    "勾选",
+                    options=["勾选", "取消勾选", "切换"],
+                ),
+                field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
+            ),
+            run_his_set_checkbox,
+        ),
+        ModuleDefinition(
+            "his.click_object",
+            "HIS 点击对象",
+            "HIS",
+            "点击对象名称可配置，例如查询、清屏、导出、打印或其他 UIA 控件。",
+            (
+                field("targetName", "点击对象名称", "text", "查询"),
+                field(
+                    "controlType",
+                    "控件类型",
+                    "select",
+                    "自动",
+                    options=[
+                        "自动",
+                        "Button",
+                        "Hyperlink",
+                        "TabItem",
+                        "MenuItem",
+                        "Text",
+                        "DataItem",
+                        "ListItem",
+                    ],
+                ),
+                field(
+                    "matchMode",
+                    "名称匹配方式",
+                    "select",
+                    "精确匹配",
+                    options=["精确匹配", "包含文字"],
+                ),
+                field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
+            ),
+            run_his_click_object,
         ),
         ModuleDefinition(
             "his.input_hospitalization",
