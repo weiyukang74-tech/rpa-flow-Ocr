@@ -333,9 +333,36 @@ def run_ocr_mark(context: ExecutionContext, params: dict[str, Any]) -> dict[str,
     if not columns:
         raise WorkflowExecutionError("至少需要配置一个标注列名")
 
+    locate_mode = str(params.get("locateMode") or "按表格标题").strip()
+    if locate_mode not in {"按表格标题", "按目标列自动定位"}:
+        raise WorkflowExecutionError("OCR 定位方式无效")
+    table_title = str(params.get("tableTitle") or "").strip()
+    if locate_mode == "按表格标题" and not table_title:
+        raise WorkflowExecutionError("按表格标题定位时，表格标题不能为空")
+    if locate_mode == "按目标列自动定位":
+        table_title = ""
+
+    table_right_ratio = float(params.get("tableRightRatio", 0.74))
+    if not 0.2 <= table_right_ratio <= 1.0:
+        raise WorkflowExecutionError("主表右边界比例必须在 0.2～1.0 之间")
+    header_search_height = int(params.get("headerSearchHeight", 90))
+    if not 30 <= header_search_height <= 2000:
+        raise WorkflowExecutionError("表头向下查找范围必须在 30～2000 像素之间")
+
     screenshots = list(context.state.get("screenshots", []))
     if not screenshots:
         raise WorkflowExecutionError("没有可供 OCR 标注的截图")
+    screenshot_scope = str(params.get("screenshotScope") or "全部原始截图").strip()
+    if screenshot_scope == "仅当前位置截图":
+        screenshots = [path for path in screenshots if "_current_" in Path(path).name]
+    elif screenshot_scope == "仅最右端截图":
+        screenshots = [path for path in screenshots if "_rightmost_" in Path(path).name]
+    elif screenshot_scope == "仅最新一张截图":
+        screenshots = screenshots[-1:]
+    elif screenshot_scope != "全部原始截图":
+        raise WorkflowExecutionError("截图选择方式无效")
+    if not screenshots:
+        raise WorkflowExecutionError(f"没有符合“{screenshot_scope}”的截图")
     engine = context.state.get("ocr_engine")
     if engine is None:
         engine = marker.create_ocr_engine()
@@ -344,7 +371,15 @@ def run_ocr_mark(context: ExecutionContext, params: dict[str, Any]) -> dict[str,
     all_found: set[str] = set()
     outputs: list[str] = []
     for screenshot in screenshots:
-        marked_path, found = marker.annotate_screenshot(engine, screenshot, columns)
+        context.check_cancelled()
+        marked_path, found = marker.annotate_screenshot(
+            engine,
+            Path(screenshot),
+            columns,
+            table_title,
+            table_right_ratio,
+            header_search_height,
+        )
         context.state["marked_screenshots"].append(marked_path)
         all_found.update(found)
         outputs.append(str(marked_path))
@@ -496,13 +531,51 @@ def build_registry() -> WorkflowRegistry:
             "ocr.mark_columns",
             "OCR 标注表格列",
             "OCR",
-            "按表头文字定位并对可见数据列画红框。",
+            "定位对象、截图范围和列名均按本步骤配置，不影响流程中的其他步骤。",
             (
+                field(
+                    "locateMode",
+                    "定位方式",
+                    "select",
+                    "按表格标题",
+                    options=["按表格标题", "按目标列自动定位"],
+                ),
+                field("tableTitle", "表格标题/定位文字", "text", "医嘱明细"),
                 field(
                     "columns",
                     "目标列（每行一个）",
                     "stringList",
                     list(marker.TARGET_HEADERS),
+                ),
+                field(
+                    "screenshotScope",
+                    "处理哪些截图",
+                    "select",
+                    "全部原始截图",
+                    options=[
+                        "全部原始截图",
+                        "仅当前位置截图",
+                        "仅最右端截图",
+                        "仅最新一张截图",
+                    ],
+                ),
+                field(
+                    "headerSearchHeight",
+                    "标题下方查找范围（像素）",
+                    "number",
+                    90,
+                    min=30,
+                    max=2000,
+                    step=10,
+                ),
+                field(
+                    "tableRightRatio",
+                    "表格右边界（窗口宽度比例）",
+                    "number",
+                    0.74,
+                    min=0.2,
+                    max=1,
+                    step=0.01,
                 ),
             ),
             run_ocr_mark,

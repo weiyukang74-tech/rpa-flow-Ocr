@@ -74,6 +74,8 @@
       "name": "09 OCR 标注审核字段",
       "enabled": true,
       "params": {
+        "locateMode": "按表格标题",
+        "tableTitle": "医嘱明细",
         "columns": [
           "医嘱名称",
           "单次剂量",
@@ -81,7 +83,10 @@
           "频次",
           "总量",
           "总量单位"
-        ]
+        ],
+        "screenshotScope": "全部原始截图",
+        "headerSearchHeight": 90,
+        "tableRightRatio": 0.74
       }
     }
   ]

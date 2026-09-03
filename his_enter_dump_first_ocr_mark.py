@@ -5,7 +5,7 @@ r"""运行 HIS 查询，并用 OCR 给指定医嘱列画红框。
 
 1. 检查 HIS 窗口是否最大化，未最大化则先最大化；
 2. 调用原脚本完成住院号查询、点击结果和左右两张截图；
-3. 用 RapidOCR 识别“医嘱明细”表头；
+3. 用 RapidOCR 按配置的表格标题或目标列定位表头；
 4. 给截图中实际出现的六个目标列画红框，另存为 ``*_marked.png``。
 
 首次使用需要在当前虚拟环境安装 OCR 依赖：
@@ -192,17 +192,25 @@ def run_ocr(engine: Any, image_path: Path) -> list[OcrItem]:
     return parse_ocr_result(result, scale)
 
 
-def locate_table_title(items: Sequence[OcrItem]) -> OcrItem | None:
-    """找到主区域的“医嘱明细”标题，排除右侧其他小表。"""
+def locate_table_title(
+    items: Sequence[OcrItem],
+    table_title: str = "医嘱明细",
+    match_threshold: float = 0.72,
+) -> OcrItem | None:
+    """按配置文字查找表格标题，不再把“医嘱明细”写死。"""
 
-    exact = [item for item in items if "医嘱明细" in item.text]
+    target = normalize_ocr_text(table_title)
+    if not target:
+        return None
+
+    exact = [item for item in items if target in item.text]
     if exact:
         return min(exact, key=lambda item: (item.left, item.top))
 
     fuzzy = [
         item
         for item in items
-        if SequenceMatcher(None, item.text, "医嘱明细").ratio() >= 0.72
+        if SequenceMatcher(None, item.text, target).ratio() >= match_threshold
     ]
     return min(fuzzy, key=lambda item: (item.left, item.top)) if fuzzy else None
 
@@ -234,25 +242,11 @@ def narrow_merged_item(item: OcrItem, target: str) -> OcrItem:
     return OcrItem(target, item.score, left, item.top, right, item.bottom)
 
 
-def find_header_matches(
-    items: Sequence[OcrItem],
-    image_width: int,
-    target_headers: Sequence[str] = TARGET_HEADERS,
-) -> tuple[list[HeaderMatch], OcrItem]:
-    title = locate_table_title(items)
-    if title is None:
-        raise RuntimeError("OCR 未找到主表标题“医嘱明细”，无法可靠确定表头区域")
-
-    # 主表表头紧邻标题下方。最大化窗口后右侧栏通常从宽度的约 72% 开始。
-    header_top = title.bottom - 5
-    header_bottom = title.bottom + 90
-    main_table_right = round(image_width * 0.74)
-    candidates = [
-        item
-        for item in items
-        if header_top <= item.center_y <= header_bottom
-        and item.left < main_table_right
-    ]
+def match_header_candidates(
+    candidates: Sequence[OcrItem],
+    target_headers: Sequence[str],
+) -> list[HeaderMatch]:
+    """在同一候选区域内匹配配置的列名。"""
 
     matches: list[HeaderMatch] = []
     used: set[int] = set()
@@ -260,7 +254,6 @@ def find_header_matches(
         ranked: list[tuple[float, int, OcrItem]] = []
         for index, item in enumerate(candidates):
             score = target_match_score(item.text, target)
-            # 文本置信度只作轻微加权；表头文字相似度是主要依据。
             combined = score * 0.9 + item.score * 0.1
             ranked.append((combined, index, item))
         if not ranked:
@@ -275,6 +268,85 @@ def find_header_matches(
                 item=narrow_merged_item(item, target),
                 match_score=combined,
             )
+        )
+    return matches
+
+
+def find_best_header_row(
+    items: Sequence[OcrItem],
+    target_headers: Sequence[str],
+    search_top: int,
+    search_bottom: int,
+    table_right: int,
+) -> list[HeaderMatch]:
+    """按同一水平行聚类，避免把查询表单里的同名标签误认为表头。"""
+
+    candidates = [
+        item
+        for item in items
+        if search_top <= item.center_y <= search_bottom and item.left < table_right
+    ]
+    possible = [
+        item
+        for item in candidates
+        if any(target_match_score(item.text, target) >= 0.70 for target in target_headers)
+    ]
+    best_matches: list[HeaderMatch] = []
+    best_key: tuple[int, float, float] = (0, 0.0, 0.0)
+    for anchor in possible:
+        row = [item for item in candidates if abs(item.center_y - anchor.center_y) <= 22]
+        matches = match_header_candidates(row, target_headers)
+        key = (
+            len(matches),
+            sum(match.match_score for match in matches),
+            -anchor.center_y,
+        )
+        if key > best_key:
+            best_key = key
+            best_matches = matches
+    return best_matches
+
+
+def find_header_matches(
+    items: Sequence[OcrItem],
+    image_width: int,
+    target_headers: Sequence[str] = TARGET_HEADERS,
+    table_title: str | None = "医嘱明细",
+    table_right_ratio: float = 0.74,
+    header_search_height: int = 90,
+) -> tuple[list[HeaderMatch], OcrItem]:
+    if not 0.2 <= table_right_ratio <= 1.0:
+        raise RuntimeError("主表右边界比例必须在 0.2～1.0 之间")
+    if not 30 <= header_search_height <= 2000:
+        raise RuntimeError("表头向下查找范围必须在 30～2000 像素之间")
+
+    main_table_right = round(image_width * table_right_ratio)
+    configured_title = normalize_ocr_text(table_title or "")
+    if configured_title:
+        title = locate_table_title(items, configured_title)
+        if title is None:
+            raise RuntimeError(
+                f"OCR 未找到配置的表格标题“{table_title}”；可修改标题，或把定位方式改为按目标列自动定位"
+            )
+        search_top = max(0, title.bottom - 5)
+        search_bottom = title.bottom + header_search_height
+    else:
+        # 没有独立标题的表格，直接在整张图片里寻找目标列最集中的水平行。
+        title = OcrItem("自动定位", 1.0, 0, 0, main_table_right, 0)
+        search_top = 0
+        search_bottom = 100_000
+
+    matches = find_best_header_row(
+        items,
+        target_headers,
+        search_top,
+        search_bottom,
+        main_table_right,
+    )
+    if not matches:
+        title_hint = f"表格标题“{table_title}”下方" if configured_title else "整张截图中"
+        raise RuntimeError(
+            f"OCR 在{title_hint}未找到目标列：{', '.join(target_headers)}"
         )
     return matches, title
 
@@ -363,6 +435,9 @@ def annotate_screenshot(
     engine: Any,
     source_path: Path,
     target_headers: Sequence[str] = TARGET_HEADERS,
+    table_title: str | None = "医嘱明细",
+    table_right_ratio: float = 0.74,
+    header_search_height: int = 90,
 ) -> tuple[Path, list[str]]:
     """识别可见目标列，给整列可见数据区画框并另存图片。"""
 
@@ -370,9 +445,16 @@ def annotate_screenshot(
     with Image.open(source_path) as source:
         image = source.convert("RGB")
 
-    matches, title = find_header_matches(items, image.width, target_headers)
-    main_table_right = round(image.width * 0.74)
-    header_top = max(title.bottom + 1, min((match.item.top for match in matches), default=title.bottom + 10) - 8)
+    matches, _title = find_header_matches(
+        items,
+        image.width,
+        target_headers,
+        table_title,
+        table_right_ratio,
+        header_search_height,
+    )
+    main_table_right = round(image.width * table_right_ratio)
+    header_top = max(0, min(match.item.top for match in matches) - 8)
     header_bottom = max((match.item.bottom for match in matches), default=header_top + 25) + 7
     data_bottom = infer_data_bottom(items, header_bottom, image.height, main_table_right)
     grid_lines = find_vertical_grid_lines(
