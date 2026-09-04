@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from PIL import ImageGrab
+from PIL import Image, ImageDraw, ImageGrab
 
 STUDIO_ROOT = Path(__file__).resolve().parent
 
@@ -554,6 +554,704 @@ def safe_file_component(value: object) -> str:
     return cleaned[:100] or "capture"
 
 
+ELLIPSIS_SUFFIXES = ("...", "..", "…", "．．．", "···", "。。。")
+
+
+def ocr_item_looks_truncated(
+    item: marker.OcrItem,
+    column_right: int,
+    edge_margin_pixels: int,
+) -> bool:
+    """Detect an ellipsis, with a right-edge fallback for OCR engines that drop dots."""
+
+    raw_text = "".join(str(getattr(item, "raw_text", "") or item.text).split())
+    if raw_text.endswith(ELLIPSIS_SUFFIXES):
+        return True
+    # OCR 偶尔把界面上的三个点只识别成一个点。此时必须同时满足文字框
+    # 已贴近列右边界，避免把“每周3次”这类恰好较长但完整的值误判。
+    return raw_text.endswith((".", "。")) and item.right >= column_right - edge_margin_pixels
+
+
+def cluster_ocr_rows(
+    items: list[marker.OcrItem],
+    tolerance: int = 18,
+) -> list[list[marker.OcrItem]]:
+    """Cluster screenshot OCR boxes into visual rows from top to bottom."""
+
+    rows: list[list[marker.OcrItem]] = []
+    for item in sorted(items, key=lambda entry: (entry.center_y, entry.left)):
+        for row in rows:
+            row_center = sum(entry.center_y for entry in row) / len(row)
+            if abs(item.center_y - row_center) <= tolerance:
+                row.append(item)
+                break
+        else:
+            rows.append([item])
+    for row in rows:
+        row.sort(key=lambda item: item.left)
+    return sorted(rows, key=lambda row: min(item.center_y for item in row))
+
+
+def find_gray_column_resize_handle(
+    image: Image.Image,
+    divider_x: int,
+    header_top: int,
+    header_bottom: int,
+) -> tuple[int, int, bool]:
+    """Locate the short gray resize bar inside a column-header separator."""
+
+    pixels = image.load()
+    best: tuple[int, int, int] | None = None
+    search_top = max(0, header_top)
+    search_bottom = min(image.height - 1, header_bottom)
+    for x in range(max(0, divider_x - 7), min(image.width - 1, divider_x + 7) + 1):
+        matching_y: list[int] = []
+        for y in range(search_top, search_bottom + 1):
+            red, green, blue = pixels[x, y]
+            brightness = (red + green + blue) / 3
+            if 155 <= brightness <= 232 and max(red, green, blue) - min(red, green, blue) <= 22:
+                matching_y.append(y)
+
+        runs: list[list[int]] = []
+        for y in matching_y:
+            if not runs or y - runs[-1][-1] > 1:
+                runs.append([y])
+            else:
+                runs[-1].append(y)
+        if not runs:
+            continue
+        longest = max(runs, key=len)
+        candidate = (len(longest), x, round((longest[0] + longest[-1]) / 2))
+        if best is None or candidate[0] > best[0]:
+            best = candidate
+
+    if best is None or best[0] < 8:
+        return divider_x, round((header_top + header_bottom) / 2), False
+    return best[1], best[2], True
+
+
+def analyze_table_columns_width(
+    engine: Any,
+    screenshot_path: Path,
+    table_title: str,
+    table_right_ratio: float,
+    header_search_height: int,
+    edge_margin_pixels: int,
+) -> dict[str, Any]:
+    """Use only screenshot OCR and grid lines to find every clipped visible column."""
+
+    items = marker.run_ocr(engine, screenshot_path)
+    with Image.open(screenshot_path) as source:
+        image = source.convert("RGB")
+
+    main_table_right = round(image.width * table_right_ratio)
+    title = marker.locate_table_title(items, table_title)
+    if title is None:
+        raise RuntimeError(f"OCR 未找到配置的表格标题“{table_title}”")
+
+    search_top = max(title.bottom + 1, 0)
+    search_bottom = title.bottom + header_search_height
+    candidates = [
+        item
+        for item in items
+        if search_top <= item.center_y <= search_bottom
+        and item.left < main_table_right
+    ]
+    rows = [row for row in cluster_ocr_rows(candidates) if len(row) >= 2]
+    if not rows:
+        raise RuntimeError(f"OCR 未找到表格“{table_title}”的表头行")
+
+    # 表头是标题下方第一条包含多个文字框的水平行。这里不读取 DOM/UIA
+    # 中的完整值，后续所有判断都只使用截图里实际可见的 OCR 框。
+    header_items = min(rows, key=lambda row: min(item.center_y for item in row))
+    header_top = max(0, min(item.top for item in header_items) - 8)
+    header_bottom = max(item.bottom for item in header_items) + 7
+    data_bottom = marker.infer_data_bottom(
+        items,
+        header_bottom,
+        image.height,
+        main_table_right,
+    )
+    boundaries = sorted(
+        set(
+            marker.find_vertical_grid_lines(
+                image,
+                header_top,
+                data_bottom,
+                main_table_right,
+            )
+        )
+    )
+    if len(boundaries) < 2:
+        raise RuntimeError(f"未检测到表格“{table_title}”的列分隔线")
+
+    first_header_left = min(item.left for item in header_items)
+    last_header_right = max(item.right for item in header_items)
+    if boundaries[0] > first_header_left:
+        boundaries.insert(0, max(0, first_header_left - 12))
+    if boundaries[-1] < last_header_right:
+        boundaries.append(min(main_table_right, last_header_right + 12))
+
+    data_items = [
+        item
+        for item in items
+        if item.top >= header_bottom
+        and item.bottom <= data_bottom
+        and item.left < main_table_right
+    ]
+    columns: list[dict[str, Any]] = []
+    for index, (column_left, column_right) in enumerate(
+        zip(boundaries, boundaries[1:]),
+        start=1,
+    ):
+        if column_right - column_left < 18:
+            continue
+        column_headers = [
+            item
+            for item in header_items
+            if column_left < item.center_x < column_right
+        ]
+        if not column_headers:
+            continue
+        column_data = [
+            item
+            for item in data_items
+            if column_left < item.center_x < column_right
+        ]
+        truncated_items = [
+            item
+            for item in column_data
+            if ocr_item_looks_truncated(item, column_right, edge_margin_pixels)
+        ]
+        raw_header = "".join(
+            str(getattr(item, "raw_text", "") or item.text)
+            for item in sorted(column_headers, key=lambda entry: entry.left)
+        ).strip()
+        header_text = raw_header or f"第{index}列"
+        # OCR 标题可能在列宽变化后由“医嘱...”变成“医嘱名称”。列身份必须
+        # 与显示文字解耦，否则成功拓宽后会被误判成原列消失。
+        column_key = f"column-{index}"
+        handle_x, handle_y, handle_found = find_gray_column_resize_handle(
+            image,
+            column_right,
+            header_top,
+            header_bottom,
+        )
+        columns.append(
+            {
+                "key": column_key,
+                "headerText": header_text,
+                "columnLeft": column_left,
+                "columnRight": column_right,
+                "width": column_right - column_left,
+                "resizeHandleX": handle_x,
+                "resizeHandleY": handle_y,
+                "resizeHandleFound": handle_found,
+                "dataItemCount": len(column_data),
+                "truncatedTexts": [
+                    str(getattr(item, "raw_text", "") or item.text)
+                    for item in truncated_items
+                ],
+            }
+        )
+
+    return {
+        "headerTop": header_top,
+        "dataBottom": data_bottom,
+        "titleRect": [title.left, title.top, title.right, title.bottom],
+        "headerCenterY": round(
+            sum(item.center_y for item in header_items) / len(header_items)
+        ),
+        "imageWidth": image.width,
+        "columns": columns,
+        "truncatedColumns": [
+            column for column in columns if column["truncatedTexts"]
+        ],
+    }
+
+
+def mark_truncated_columns(
+    screenshot_path: Path,
+    analysis: dict[str, Any],
+) -> Path:
+    """Draw red boxes around columns judged clipped from the rendered screenshot."""
+
+    with Image.open(screenshot_path) as source:
+        image = source.convert("RGB")
+    draw = ImageDraw.Draw(image)
+    header_top = int(analysis["headerTop"])
+    data_bottom = int(analysis["dataBottom"])
+    for column in analysis["truncatedColumns"]:
+        left = int(column["columnLeft"])
+        right = int(column["columnRight"])
+        handle_x = int(column.get("resizeHandleX", right))
+        handle_y = int(column.get("resizeHandleY", analysis["headerCenterY"]))
+        draw.rectangle(
+            (left + 1, header_top, right - 1, data_bottom),
+            outline=marker.MARK_COLOR,
+            width=marker.MARK_WIDTH,
+        )
+        # 蓝色小圆标出鼠标实际按下点：对应列名右侧的灰色短竖杠中心。
+        draw.ellipse(
+            (handle_x - 7, handle_y - 7, handle_x + 7, handle_y + 7),
+            outline=(0, 102, 255),
+            width=3,
+        )
+    marked_path = screenshot_path.with_name(f"{screenshot_path.stem}_marked.png")
+    image.save(marked_path)
+    return marked_path
+
+
+def is_panel_border_pixel(color: tuple[int, int, int]) -> bool:
+    red, green, blue = color
+    brightness = (red + green + blue) / 3
+    return 185 <= brightness <= 245 and max(color) - min(color) <= 20
+
+
+def find_table_region(
+    screenshot_path: Path,
+    analysis: dict[str, Any],
+    table_right_ratio: float,
+) -> tuple[int, int, int, int]:
+    """Find the outer panel that owns the configured table title."""
+
+    with Image.open(screenshot_path) as source:
+        image = source.convert("RGB")
+    pixels = image.load()
+    width, height = image.size
+    title_left, title_top, _title_right, title_bottom = analysis["titleRect"]
+    vertical_top = max(0, int(title_top) - 20)
+    vertical_bottom = max(vertical_top + 1, height - 55)
+
+    def vertical_score(x: int) -> int:
+        return sum(
+            1
+            for y in range(vertical_top, vertical_bottom + 1)
+            if is_panel_border_pixel(pixels[x, y])
+            and sum(pixels[x, y]) / 3 <= 225
+        )
+
+    left_candidates = range(0, max(2, min(int(title_left), round(width * 0.12))))
+    left = max(left_candidates, key=vertical_score)
+    expected_right = round(width * table_right_ratio)
+    right_start = max(left + 100, expected_right - 45)
+    right_end = min(width - 2, expected_right + 20)
+    right = max(range(right_start, right_end + 1), key=vertical_score)
+
+    def horizontal_score(y: int) -> int:
+        return sum(
+            1
+            for x in range(left, right + 1, 2)
+            if is_panel_border_pixel(pixels[x, y])
+        )
+
+    top_range = range(max(0, int(title_top) - 30), int(title_top) + 1)
+    top_scores = [(horizontal_score(y), y) for y in top_range]
+    best_top_score = max(score for score, _y in top_scores)
+    top = min(y for score, y in top_scores if score >= best_top_score * 0.9)
+
+    bottom_start = min(height - 2, max(int(title_bottom) + 80, int(analysis["dataBottom"]) + 20))
+    bottom_end = max(bottom_start, height - 30)
+    bottom_scores = [
+        (horizontal_score(y), y) for y in range(bottom_start, bottom_end + 1)
+    ]
+    best_bottom_score = max(score for score, _y in bottom_scores)
+    bottom = max(
+        y for score, y in bottom_scores if score >= best_bottom_score * 0.9
+    )
+    return left, top, right, bottom
+
+
+def mark_table_region(
+    screenshot_path: Path,
+    analysis: dict[str, Any],
+    table_right_ratio: float,
+) -> tuple[Path, tuple[int, int, int, int]]:
+    """Draw a red outline around the whole panel selected by the table title."""
+
+    region = find_table_region(screenshot_path, analysis, table_right_ratio)
+    with Image.open(screenshot_path) as source:
+        image = source.convert("RGB")
+    draw = ImageDraw.Draw(image)
+    left, top, right, bottom = region
+    draw.rectangle(
+        (left + 1, top + 1, right - 1, bottom - 1),
+        outline=marker.MARK_COLOR,
+        width=marker.MARK_WIDTH,
+    )
+    marked_path = screenshot_path.with_name(
+        f"{screenshot_path.stem}_table_region_marked.png"
+    )
+    image.save(marked_path)
+    return marked_path, region
+
+
+def current_cursor_handle() -> int | None:
+    """Read the current Windows cursor handle without assuming a cursor type."""
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class CursorInfo(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hCursor", wintypes.HANDLE),
+                ("ptScreenPos", wintypes.POINT),
+            ]
+
+        info = CursorInfo()
+        info.cbSize = ctypes.sizeof(CursorInfo)
+        if not ctypes.windll.user32.GetCursorInfo(ctypes.byref(info)):
+            return None
+        return int(info.hCursor) if info.hCursor else None
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def find_column_resize_hotspot(
+    screen_x: int,
+    screen_y: int,
+    column_width: int,
+) -> tuple[int, int, bool]:
+    """Find the handle by detecting a cursor-style change near the OCR divider."""
+
+    # 只在目标列内部、远离右侧分隔线的位置建立普通光标基准。不能到分隔线
+    # 右侧取样，因为那里已经属于相邻列，窄列时还可能落到另一个拖动手柄上。
+    inside_distance = max(12, min(30, max(1, column_width // 2)))
+    baseline_handles: list[int] = []
+    for baseline_x in (
+        screen_x - inside_distance,
+        screen_x - max(8, inside_distance - 6),
+    ):
+        mouse.move(coords=(baseline_x, screen_y))
+        time.sleep(0.08)
+        handle = current_cursor_handle()
+        if handle is not None:
+            baseline_handles.append(handle)
+    if not baseline_handles:
+        return screen_x, screen_y, False
+    baseline_handle = max(set(baseline_handles), key=baseline_handles.count)
+
+    # 先查最可能的中心位置，再逐像素向左右及上下扩展。网页可以使用
+    # 任意 CSS 光标，只要句柄不同于普通表头光标，就视为命中拖动手柄。
+    x_offsets = (0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5, -6, 6, -7, 7, -8, 8)
+    y_offsets = (0, -2, 2, -4, 4)
+    for y_offset in y_offsets:
+        for x_offset in x_offsets:
+            candidate_x = screen_x + x_offset
+            candidate_y = screen_y + y_offset
+            mouse.move(coords=(candidate_x, candidate_y))
+            time.sleep(0.06)
+            handle = current_cursor_handle()
+            if handle is not None and handle != baseline_handle:
+                return candidate_x, candidate_y, True
+    return screen_x, screen_y, False
+
+
+def drag_column_resize_handle(
+    start: tuple[int, int],
+    end: tuple[int, int],
+    duration_seconds: float,
+) -> None:
+    """Keep LEFTDOWN active for the entire native Windows drag movement."""
+
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    mouse_event_left_down = 0x0002
+    mouse_event_left_up = 0x0004
+    user32.SetCursorPos(start[0], start[1])
+    time.sleep(0.1)
+    # 这里只发送一次 LEFTDOWN；整个移动循环中绝不发送 LEFTUP。
+    user32.mouse_event(mouse_event_left_down, 0, 0, 0, 0)
+    try:
+        # 按住后稍停，让网页表格进入列宽调整状态。
+        time.sleep(0.3)
+        steps = max(40, round(duration_seconds / 0.025))
+        for step in range(1, steps + 1):
+            x = round(start[0] + (end[0] - start[0]) * step / steps)
+            y = round(start[1] + (end[1] - start[1]) * step / steps)
+            user32.SetCursorPos(x, y)
+            time.sleep(duration_seconds / steps)
+        user32.SetCursorPos(end[0], end[1])
+        time.sleep(0.2)
+    finally:
+        # 到达终点后才发送唯一一次 LEFTUP。
+        user32.mouse_event(mouse_event_left_up, 0, 0, 0, 0)
+
+
+def run_his_expand_table_column(
+    context: ExecutionContext,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Scan all visible table columns and expand every visually clipped column."""
+
+    table_title = str(params.get("tableTitle") or "医嘱明细").strip()
+    if not table_title:
+        raise WorkflowExecutionError("表格标题不能为空")
+
+    expand_pixels = int(params.get("expandPixels", 80))
+    max_expand_pixels = int(params.get("maxExpandPixels", 320))
+    edge_margin_pixels = int(params.get("edgeMarginPixels", 12))
+    configured_table_right_ratio = float(params.get("tableRightRatio", 0.755))
+    # 当前 HIS 的医嘱主表位于窗口左侧约 75.5%，右侧是独立的执行记录区域。
+    # 旧步骤可能保存了 1.0，这里自动收紧，防止把右侧附属表误当主表。
+    table_right_ratio = min(configured_table_right_ratio, 0.755)
+    header_search_height = int(params.get("headerSearchHeight", 120))
+    layout_wait_seconds = float(params.get("layoutWaitSeconds", 0.6))
+    handle_hover_seconds = float(params.get("handleHoverSeconds", 0.4))
+    drag_duration_seconds = float(params.get("dragDurationSeconds", 2.0))
+    max_drag_count = int(params.get("maxDragCount", 30))
+    min_visible_columns = int(params.get("minVisibleColumns", 4))
+    save_diagnostics = bool(params.get("_saveDiagnostics", True))
+    if not 10 <= expand_pixels <= 500:
+        raise WorkflowExecutionError("单次拓宽像素必须在 10～500 之间")
+    if not expand_pixels <= max_expand_pixels <= 1200:
+        raise WorkflowExecutionError("最大拓宽像素必须不小于单次拓宽，且不超过 1200")
+    if not 1 <= edge_margin_pixels <= 40:
+        raise WorkflowExecutionError("贴边判定距离必须在 1～40 像素之间")
+    if not 0.2 <= configured_table_right_ratio <= 1.0:
+        raise WorkflowExecutionError("表格右边界比例必须在 0.2～1.0 之间")
+    if not 30 <= header_search_height <= 2000:
+        raise WorkflowExecutionError("标题下方查找范围必须在 30～2000 像素之间")
+    if not 0 <= layout_wait_seconds <= 10:
+        raise WorkflowExecutionError("拖动后等待时间必须在 0～10 秒之间")
+    if not 0 <= handle_hover_seconds <= 3:
+        raise WorkflowExecutionError("手柄停留时间必须在 0～3 秒之间")
+    if not 0.5 <= drag_duration_seconds <= 10:
+        raise WorkflowExecutionError("按住拖动时间必须在 0.5～10 秒之间")
+    if not 1 <= max_drag_count <= 100:
+        raise WorkflowExecutionError("最多拖动次数必须在 1～100 之间")
+    if not 2 <= min_visible_columns <= 100:
+        raise WorkflowExecutionError("最少可见列数必须在 2～100 之间")
+
+    engine = context.state.get("ocr_engine")
+    if engine is None:
+        engine = marker.create_ocr_engine()
+        context.state["ocr_engine"] = engine
+    window = current_window(context)
+
+    def probe() -> dict[str, Any]:
+        context.check_cancelled()
+        probe_serial = int(context.state.get("table_width_probe_serial", 0)) + 1
+        context.state["table_width_probe_serial"] = probe_serial
+        probe_name = (
+            f"table_width_probe_{context.state['timestamp']}_{probe_serial:02d}.png"
+            if save_diagnostics
+            else f".rpa_table_width_probe_{context.state['timestamp']}_{probe_serial:02d}.png"
+        )
+        probe_path = context.output_dir / probe_name
+        his.capture_his_window(window, probe_path)
+        if save_diagnostics:
+            context.state["last_table_width_probe"] = probe_path
+            context.emit(
+                "info",
+                f"表格列宽 OCR 检测截图已保存：{probe_path}",
+                {"path": str(probe_path)},
+            )
+        try:
+            analysis = analyze_table_columns_width(
+                engine,
+                probe_path,
+                table_title,
+                table_right_ratio,
+                header_search_height,
+                edge_margin_pixels,
+            )
+        finally:
+            if not save_diagnostics:
+                try:
+                    probe_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        analysis["probePath"] = str(probe_path)
+        return analysis
+
+    requested_by_column: dict[str, int] = {}
+    initial_width_by_column: dict[str, int] = {}
+    blocked_columns: set[str] = set()
+    previous_drag: tuple[str, int] | None = None
+    drag_count = 0
+    while True:
+        try:
+            analysis = probe()
+        except RuntimeError as exc:
+            raise WorkflowExecutionError(f"自动扫描表格列失败：{exc}") from exc
+
+        visible_columns = list(analysis["columns"])
+        merged_headers = [
+            str(column["headerText"])
+            for column in visible_columns
+            if len(marker.normalize_ocr_text(column["headerText"])) > 12
+        ]
+        if len(visible_columns) < min_visible_columns or merged_headers:
+            details = (
+                f"仅识别到 {len(visible_columns)} 列"
+                if len(visible_columns) < min_visible_columns
+                else "检测到疑似被 OCR 合并的表头：" + "，".join(merged_headers)
+            )
+            diagnostic_hint = (
+                f"请查看检测截图：{analysis['probePath']}"
+                if save_diagnostics
+                else "请检查配置的表格标题和主表右边界"
+            )
+            raise WorkflowExecutionError(
+                f"表格区域定位不可靠（{details}），已停止拖动；{diagnostic_hint}"
+            )
+
+        if save_diagnostics:
+            marked_path = mark_truncated_columns(Path(analysis["probePath"]), analysis)
+            table_region_path, table_region = mark_table_region(
+                Path(analysis["probePath"]),
+                analysis,
+                table_right_ratio,
+            )
+            truncated_names = [
+                str(column["headerText"]) for column in analysis["truncatedColumns"]
+            ]
+            context.emit(
+                "info",
+                f"显示不全列标注图已保存：{marked_path}；"
+                f"识别列：{('，'.join(truncated_names) if truncated_names else '无')}",
+                {"path": str(marked_path), "columns": truncated_names},
+            )
+            context.emit(
+                "info",
+                f"配置表“{table_title}”区域标注图已保存：{table_region_path}",
+                {"path": str(table_region_path), "region": list(table_region)},
+            )
+        columns_by_key = {column["key"]: column for column in visible_columns}
+        for column in visible_columns:
+            initial_width_by_column.setdefault(column["key"], int(column["width"]))
+
+        if previous_drag is not None:
+            previous_key, previous_width = previous_drag
+            current = columns_by_key.get(previous_key)
+            if current is None or int(current["width"]) <= previous_width + 2:
+                name = str(current["headerText"]) if current else previous_key
+                raise WorkflowExecutionError(
+                    f"已定位“{name}”列分隔线，但拖动后列宽没有变化；"
+                    "请确认该表格允许鼠标调整列宽"
+                )
+            previous_drag = None
+
+        truncated_columns = list(analysis["truncatedColumns"])
+        if not truncated_columns:
+            expanded_columns = {
+                str(column["headerText"]): max(
+                    0,
+                    int(column["width"])
+                    - initial_width_by_column.get(column["key"], int(column["width"])),
+                )
+                for column in analysis["columns"]
+                if requested_by_column.get(column["key"], 0) > 0
+            }
+            message = (
+                "大表可见列均未发现省略号或右边界截断，无需拓宽"
+                if not expanded_columns
+                else "已完成表格列拓宽并复检："
+                + "，".join(
+                    f"{name}约{pixels}像素"
+                    for name, pixels in expanded_columns.items()
+                )
+            )
+            context.emit("info", message, None)
+            return {
+                "expanded": bool(expanded_columns),
+                "expandedColumns": expanded_columns,
+                "complete": True,
+                "visibleColumnCount": len(analysis["columns"]),
+            }
+
+        eligible = [
+            column
+            for column in truncated_columns
+            if column["key"] not in blocked_columns
+            and requested_by_column.get(column["key"], 0) < max_expand_pixels
+        ]
+        if not eligible or drag_count >= max_drag_count:
+            unresolved = [str(column["headerText"]) for column in truncated_columns]
+            context.emit(
+                "warning",
+                "下列可见列仍疑似显示不全，但已达到拖动限制或屏幕空间不足："
+                + "，".join(unresolved),
+                {"columns": unresolved},
+            )
+            return {
+                "expanded": bool(requested_by_column),
+                "expandedColumns": requested_by_column,
+                "complete": False,
+                "unresolvedColumns": unresolved,
+            }
+
+        rect = window.rectangle()
+        # 从最右侧开始处理，这样拓宽右侧列不会改变左侧分隔线坐标。
+        target = max(eligible, key=lambda column: int(column["columnRight"]))
+        column_key = str(target["key"])
+        column_name = str(target["headerText"])
+        current_right = int(target["columnRight"])
+        requested = requested_by_column.get(column_key, 0)
+        remaining = max_expand_pixels - requested
+        drag_pixels = min(
+            expand_pixels,
+            remaining,
+            rect.right - rect.left - current_right - 20,
+        )
+        if drag_pixels < 10:
+            blocked_columns.add(column_key)
+            context.emit(
+                "warning",
+                f"“{column_name}”列右侧屏幕空间不足，跳过后继续检查其他列",
+                None,
+            )
+            continue
+        handle_x = int(target.get("resizeHandleX", current_right))
+        handle_y = int(target.get("resizeHandleY", analysis["headerCenterY"]))
+        screen_x = rect.left + handle_x
+        screen_y = rect.top + handle_y
+        if not bool(target.get("resizeHandleFound", False)):
+            context.emit(
+                "warning",
+                f"未在“{column_name}”列右侧检测到灰色短竖杠，停止拖动以避免误点",
+                {"point": [screen_x, screen_y]},
+            )
+            blocked_columns.add(column_key)
+            continue
+        hotspot_x, hotspot_y, cursor_changed = find_column_resize_hotspot(
+            screen_x,
+            screen_y,
+            int(target["width"]),
+        )
+        if not cursor_changed:
+            context.emit(
+                "warning",
+                f"已找到“{column_name}”列右侧灰色短竖杠，但附近鼠标样式没有变化，停止拖动",
+                {"point": [screen_x, screen_y]},
+            )
+            blocked_columns.add(column_key)
+            continue
+        context.emit(
+            "info",
+            f"“{column_name}”列检测到 {len(target['truncatedTexts'])} 个疑似截断单元格，"
+            f"鼠标样式已在灰色短竖杠 ({hotspot_x}, {hotspot_y}) 发生变化，"
+            f"向右拓宽 {drag_pixels} 像素",
+            {"texts": target["truncatedTexts"], "point": [hotspot_x, hotspot_y]},
+        )
+        mouse.move(coords=(hotspot_x, hotspot_y))
+        context.wait(handle_hover_seconds)
+        previous_drag = (column_key, int(target["width"]))
+        drag_column_resize_handle(
+            (hotspot_x, hotspot_y),
+            (hotspot_x + drag_pixels, hotspot_y),
+            drag_duration_seconds,
+        )
+        requested_by_column[column_key] = requested + drag_pixels
+        drag_count += 1
+        context.wait(layout_wait_seconds)
+
+
 def run_capture_current(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
     prefix = safe_file_component(
         params.get("filePrefix")
@@ -596,6 +1294,122 @@ def run_capture_rightmost(context: ExecutionContext, params: dict[str, Any]) -> 
                 his.drag_scrollbar(right_state[0], original_position)
                 time.sleep(0.35)
     return {"captured": True, "path": str(path)}
+
+
+def run_his_expand_capture_full_table(
+    context: ExecutionContext,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Expand clipped columns on both horizontal views and capture both sides."""
+
+    scroll_wait_seconds = float(params.get("scrollLayoutWaitSeconds", 0.5))
+    if not 0 <= scroll_wait_seconds <= 10:
+        raise WorkflowExecutionError("横向滚动后等待时间必须在 0～10 秒之间")
+
+    prefix = safe_file_component(
+        params.get("filePrefix")
+        or f"his_inpatient_{context.variables.get('hospitalization_number', 'unknown')}"
+    )
+    window = current_window(context)
+    timestamp = context.state["timestamp"]
+    left_path = context.output_dir / f"{prefix}_current_{timestamp}.png"
+    right_path = context.output_dir / f"{prefix}_rightmost_{timestamp}.png"
+    expand_params = dict(params)
+    # 组合模块最终只保留左右两张成品图；OCR 探测图使用后立即删除。
+    expand_params["_saveDiagnostics"] = False
+
+    context.emit("info", "组合操作 [1/6]：拓宽当前位置显示不全的表格列", None)
+    left_expand_result = run_his_expand_table_column(context, expand_params)
+
+    context.check_cancelled()
+    context.emit("info", "组合操作 [2/6]：截取当前位置", None)
+    his.capture_his_window(window, left_path)
+    context.state["current_screenshot"] = left_path
+    context.state["screenshots"].append(left_path)
+    context.emit("info", f"当前位置截图：{left_path}", {"path": str(left_path)})
+
+    context.check_cancelled()
+    context.emit("info", "组合操作 [3/6]：检测横向滚动条并拖到最右端", None)
+    scrollbar = his.detect_horizontal_scrollbar(window, left_path)
+    if scrollbar is None:
+        context.emit(
+            "warning",
+            "未检测到横向滚动条，已保存当前位置截图；右侧拓宽、右侧截图和复位无需执行",
+            None,
+        )
+        return {
+            "capturedLeft": True,
+            "capturedRight": False,
+            "leftPath": str(left_path),
+            "leftExpansion": left_expand_result,
+            "restoredLeft": True,
+        }
+
+    current_position, rightmost_position = scrollbar
+    moved_right = False
+    restored_left = False
+    right_expand_result: dict[str, Any] | None = None
+    try:
+        his.drag_scrollbar(current_position, rightmost_position)
+        moved_right = True
+        context.wait(scroll_wait_seconds)
+
+        context.check_cancelled()
+        context.emit("info", "组合操作 [4/6]：拓宽最右侧视图中显示不全的表格列", None)
+        right_expand_result = run_his_expand_table_column(context, expand_params)
+
+        context.check_cancelled()
+        context.emit("info", "组合操作 [5/6]：截取最右侧当前位置", None)
+        # 拓宽列会增加表格总宽度，因此先截图检测新的滑块范围；若产生了新的
+        # 右侧空间，则继续拖到新的最右端，再覆盖保存最终截图。
+        his.capture_his_window(window, right_path)
+        right_state = his.detect_horizontal_scrollbar(window, right_path)
+        if right_state is not None and right_state[0] != right_state[1]:
+            his.drag_scrollbar(right_state[0], right_state[1])
+            context.wait(scroll_wait_seconds)
+            his.capture_his_window(window, right_path)
+        context.state["screenshots"].append(right_path)
+        context.emit("info", f"最右端截图：{right_path}", {"path": str(right_path)})
+    finally:
+        if moved_right:
+            context.emit("info", "组合操作 [6/6]：将横向滚动条拖回最左端", None)
+            restore_source: Path | None = right_path if right_path.is_file() else None
+            if restore_source is None:
+                # 即使右侧拓宽阶段报错，也用第二张成品图判断滑块位置并复位；
+                # 不额外留下恢复用或 OCR 诊断截图。
+                try:
+                    his.capture_his_window(window, right_path)
+                    restore_source = right_path
+                except Exception:
+                    restore_source = None
+            restore_state = (
+                his.detect_horizontal_scrollbar(window, restore_source)
+                if restore_source is not None
+                else None
+            )
+            if restore_state is not None:
+                rect = window.rectangle()
+                leftmost_position = (rect.left + 1, restore_state[0][1])
+                his.drag_scrollbar(restore_state[0], leftmost_position)
+                time.sleep(0.35)
+                restored_left = True
+                context.emit("info", "横向滚动条已恢复到最左端", None)
+            else:
+                context.emit(
+                    "warning",
+                    "未能重新识别横向滚动条，无法确认滑块是否已恢复到最左端",
+                    None,
+                )
+
+    return {
+        "capturedLeft": True,
+        "capturedRight": right_path.is_file(),
+        "leftPath": str(left_path),
+        "rightPath": str(right_path),
+        "leftExpansion": left_expand_result,
+        "rightExpansion": right_expand_result,
+        "restoredLeft": restored_left,
+    }
 
 
 def run_ocr_mark(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
@@ -845,6 +1659,48 @@ def build_registry() -> WorkflowRegistry:
             "确认已经进入目标住院次的医嘱费用查询页面。",
             (field("timeoutSeconds", "超时（秒）", "number", 30, min=1, max=180, step=1),),
             run_his_wait_navigation,
+        ),
+        ModuleDefinition(
+            "his.expand_table_column",
+            "自动拓宽显示不全的列",
+            "HIS",
+            "OCR 扫描大表所有可见列，检测被右边界截断的值并拖动对应列分隔线。",
+            (
+                field("tableTitle", "表格标题/定位文字", "text", "医嘱明细"),
+                field("expandPixels", "每次向右拓宽（像素）", "number", 80, min=10, max=500, step=10),
+                field("maxExpandPixels", "每列最大拓宽（像素）", "number", 320, min=10, max=1200, step=10),
+                field("edgeMarginPixels", "OCR 文字贴近右边界距离（像素）", "number", 12, min=1, max=40, step=1),
+                field("headerSearchHeight", "标题下方查找范围（像素）", "number", 120, min=30, max=2000, step=10),
+                field("tableRightRatio", "主表右边界（窗口宽度比例）", "number", 0.755, min=0.2, max=1, step=0.001),
+                field("handleHoverSeconds", "按下前在灰色短竖杠停留（秒）", "number", 0.4, min=0, max=3, step=0.1),
+                field("dragDurationSeconds", "按住向右拖动时间（秒）", "number", 2.0, min=0.5, max=10, step=0.1),
+                field("layoutWaitSeconds", "拖动后等待（秒）", "number", 0.6, min=0, max=10, step=0.1),
+                field("maxDragCount", "最多拖动次数", "number", 30, min=1, max=100, step=1),
+                field("minVisibleColumns", "安全校验最少可见列数", "number", 4, min=2, max=100, step=1),
+            ),
+            run_his_expand_table_column,
+        ),
+        ModuleDefinition(
+            "his.expand_capture_full_table",
+            "拓宽并截取完整表格",
+            "HIS",
+            "依次拓宽左侧可见列、截图、滚到最右侧、拓宽右侧可见列、截图并恢复到最左侧。",
+            (
+                field("tableTitle", "表格标题/定位文字", "text", "医嘱明细"),
+                field("filePrefix", "截图文件名前缀", "text", "his_inpatient_${hospitalization_number}"),
+                field("expandPixels", "每次向右拓宽（像素）", "number", 80, min=10, max=500, step=10),
+                field("maxExpandPixels", "每列最大拓宽（像素）", "number", 320, min=10, max=1200, step=10),
+                field("edgeMarginPixels", "OCR 文字贴近右边界距离（像素）", "number", 12, min=1, max=40, step=1),
+                field("headerSearchHeight", "标题下方查找范围（像素）", "number", 120, min=30, max=2000, step=10),
+                field("tableRightRatio", "主表右边界（窗口宽度比例）", "number", 0.755, min=0.2, max=1, step=0.001),
+                field("handleHoverSeconds", "按下前在灰色短竖杠停留（秒）", "number", 0.4, min=0, max=3, step=0.1),
+                field("dragDurationSeconds", "按住向右拖动时间（秒）", "number", 2.0, min=0.5, max=10, step=0.1),
+                field("layoutWaitSeconds", "拓宽后等待（秒）", "number", 0.6, min=0, max=10, step=0.1),
+                field("scrollLayoutWaitSeconds", "横向滚动后等待（秒）", "number", 0.5, min=0, max=10, step=0.1),
+                field("maxDragCount", "每侧最多拖动次数", "number", 30, min=1, max=100, step=1),
+                field("minVisibleColumns", "安全校验最少可见列数", "number", 4, min=2, max=100, step=1),
+            ),
+            run_his_expand_capture_full_table,
         ),
         ModuleDefinition(
             "capture.current",

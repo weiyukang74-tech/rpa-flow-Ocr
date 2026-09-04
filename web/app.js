@@ -497,7 +497,7 @@ function renderRun() {
   const strip = $("#status-strip");
   strip.className = `status-strip ${run.status}`;
   const labels = {
-    idle: "Agent 已连接，当前空闲",
+    idle: "当前空闲",
     running: "RPA 正在操作本机桌面，请勿移动鼠标或锁屏",
     succeeded: "任务执行成功",
     cancelling: "正在安全取消任务，请稍候",
@@ -537,7 +537,7 @@ async function pollRun() {
     if ((state.run.logs?.length || 0) > previousCount) state.hiddenLogs = false;
     renderRun();
   } catch (error) {
-    $("#status-text").textContent = `Agent 连接失败：${error.message}`;
+    $("#status-text").textContent = `连接失败：${error.message}`;
   }
 }
 

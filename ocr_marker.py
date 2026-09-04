@@ -49,6 +49,7 @@ class OcrItem:
     top: int
     right: int
     bottom: int
+    raw_text: str = ""
 
     @property
     def center_x(self) -> float:
@@ -163,6 +164,7 @@ def parse_ocr_result(result: Any, scale: float) -> list[OcrItem]:
                 top=top,
                 right=right,
                 bottom=bottom,
+                raw_text=str(text or "").strip(),
             )
         )
     return items
