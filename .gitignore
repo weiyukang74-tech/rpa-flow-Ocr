@@ -4,4 +4,5 @@ __pycache__/
 output/*
 !output/.gitkeep
 configs/workflow-*.json
+configs/visual-maps/
 *.log

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ctypes
+import hashlib
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -12,6 +15,7 @@ STUDIO_ROOT = Path(__file__).resolve().parent
 
 import his_automation as his
 import ocr_marker as marker
+from visual_shape_detection import find_checkbox_square, find_input_rectangle
 from pywinauto import mouse
 from pywinauto.keyboard import send_keys
 
@@ -35,6 +39,15 @@ def field(
     return result
 
 
+def visual_page_field(default: str = "current-page") -> dict[str, Any]:
+    return field(
+        "visualPage",
+        "视觉页面标识",
+        "text",
+        default,
+    )
+
+
 def current_window(context: ExecutionContext) -> Any:
     window = his.activate_his_window()
     context.state["window"] = window
@@ -54,50 +67,29 @@ def run_window_activate(context: ExecutionContext, params: dict[str, Any]) -> di
 
 def run_window_maximize(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
     window = current_window(context)
-    try:
-        maximized = bool(window.is_maximized())
-    except Exception:
-        maximized = False
-    if not maximized:
-        window.maximize()
-        time.sleep(float(params.get("layoutWaitSeconds", 0.6)))
+    hwnd = int(getattr(window, "handle", 0) or 0)
+    if not hwnd:
+        raise WorkflowExecutionError("目标窗口没有可用的顶层句柄")
+
+    user32 = ctypes.windll.user32
+    was_maximized = bool(user32.IsZoomed(hwnd))
+    if not was_maximized:
+        # 最大化属于顶层窗口状态，不依赖 UIA 类型、标题栏样式或按钮位置。
+        user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
+        context.wait(float(params.get("layoutWaitSeconds", 0.6)))
+        if not user32.IsZoomed(hwnd):
+            raise WorkflowExecutionError(
+                "Windows 已收到最大化命令，但目标顶层窗口没有进入最大化状态"
+            )
         context.emit("info", "HIS 窗口已最大化", None)
     else:
         context.emit("info", "HIS 窗口已经是最大化状态", None)
-    return {"wasAlreadyMaximized": maximized}
-
-
-PATIENT_QUERY_GRID: dict[str, tuple[int, int]] = {
-    "卡类型": (5, 1),
-    "卡号": (1, 2),
-    "登记号": (2, 2),
-    "姓名": (3, 2),
-    "性别": (4, 2),
-    "出生日期": (5, 2),
-    "身份证": (1, 3),
-    "住院号": (2, 3),
-    "科室": (3, 3),
-    "病区": (4, 3),
-    "医生": (5, 3),
-    "就诊号": (1, 4),
-    "诊断": (2, 4),
-    "年龄": (3, 4),
-    "病历": (4, 4),
-}
-
-PATIENT_QUERY_ACTIONS: dict[str, tuple[int, int]] = {
-    "读卡": (1, 1),
-    "打印": (2, 1),
-    "查询": (1, 2),
-    "导出": (2, 2),
-    "清屏": (1, 3),
-}
-
-PATIENT_QUERY_CHECKBOXES: dict[str, int] = {
-    "门急诊患者": 1,
-    "住院患者": 2,
-    "出院患者": 3,
-}
+    rect = window.rectangle()
+    return {
+        "wasAlreadyMaximized": was_maximized,
+        "hwnd": hwnd,
+        "rectangle": [rect.left, rect.top, rect.right, rect.bottom],
+    }
 
 
 def find_his_edit_control(window: Any, field_name: str, timeout: float = 5.0) -> Any | None:
@@ -176,77 +168,496 @@ def find_named_his_control(
         time.sleep(0.2)
 
 
-def patient_query_row_step(window: Any, scale: float) -> float:
+VISUAL_MAP_ROOT = STUDIO_ROOT / "configs" / "visual-maps"
+
+
+def visual_page_id(params: dict[str, Any]) -> str:
+    """Return a user-defined logical page key without assuming any application."""
+
+    page = str(params.get("visualPage") or "current-page").strip()
+    if not page:
+        page = "current-page"
+    return page[:80]
+
+
+def visual_window_signature(window: Any, page: str) -> dict[str, Any]:
     rect = window.rectangle()
-    logical_height = (rect.bottom - rect.top) / scale
-    return (25 if logical_height <= 820 else 30) * scale
+    width = int(rect.right - rect.left)
+    height = int(rect.bottom - rect.top)
+    if width <= 0 or height <= 0:
+        raise WorkflowExecutionError("目标窗口没有有效的屏幕区域")
+    return {
+        "locatorVersion": 3,
+        "page": page,
+        "windowTitle": his.normalize_text(window.window_text()),
+        "className": str(getattr(window.element_info, "class_name", "") or ""),
+        "width": width,
+        "height": height,
+        "dpiScale": round(float(his.window_dpi_scale(window)), 3),
+    }
 
 
-def patient_query_field_point(window: Any, field_name: str) -> tuple[int, int, float]:
-    """Calculate a configured patient-query field from the responsive grid."""
-
-    if field_name not in PATIENT_QUERY_GRID:
-        raise WorkflowExecutionError(
-            f"字段“{field_name}”没有可用的布局坐标，且 UIA 未识别到该控件"
-        )
-    column, row = PATIENT_QUERY_GRID[field_name]
-    hospitalization_x, hospitalization_y, scale = his.hospitalization_field_point(window)
-    rect = window.rectangle()
-    logical_width = (rect.right - rect.left) / scale
-    logical_height = (rect.bottom - rect.top) / scale
-
-    if logical_width <= 1500:
-        gap, fixed_action_width = 7, 78 * 2
-    else:
-        gap, fixed_action_width = 11, 84 * 2
-    grid_inner_width = logical_width - 20
-    flexible_column_width = (
-        grid_inner_width - fixed_action_width - gap * 7
-    ) / 6
-    column_step = (flexible_column_width + gap) * scale
-    row_step = (25 if logical_height <= 820 else 30) * scale
-
-    x = round(hospitalization_x + (column - 2) * column_step)
-    y = round(hospitalization_y + (row - 3) * row_step)
-    if not (rect.left < x < rect.right and rect.top < y < rect.bottom):
-        raise WorkflowExecutionError(f"字段“{field_name}”的坐标超出 HIS 窗口")
-    return x, y, scale
+def visual_map_path(signature: dict[str, Any]) -> Path:
+    identity = json.dumps(signature, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+    return VISUAL_MAP_ROOT / f"page-{digest}" / "layout.json"
 
 
-def patient_query_action_point(window: Any, action_name: str) -> tuple[int, int]:
-    """Locate the five standard action buttons in the patient query panel."""
+def visual_reference_path(signature: dict[str, Any]) -> Path:
+    return visual_map_path(signature).with_name("reference.png")
 
-    if action_name not in PATIENT_QUERY_ACTIONS:
-        raise WorkflowExecutionError(
-            f"对象“{action_name}”未被 UIA 识别，也没有可用的患者查询布局坐标"
-        )
-    action_column, action_row = PATIENT_QUERY_ACTIONS[action_name]
-    _hospitalization_x, hospitalization_y, scale = patient_query_field_point(
-        window, "住院号"
+
+def load_visual_targets(signature: dict[str, Any]) -> dict[str, list[int]]:
+    path = visual_map_path(signature)
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    if value.get("signature") != signature or not isinstance(value.get("targets"), dict):
+        return {}
+    targets: dict[str, list[int]] = {}
+    for key, point in value["targets"].items():
+        if (
+            isinstance(key, str)
+            and isinstance(point, list)
+            and len(point) == 2
+            and all(isinstance(item, int) for item in point)
+        ):
+            targets[key] = point
+    return targets
+
+
+def save_visual_targets(page_map: dict[str, Any]) -> None:
+    path = visual_map_path(page_map["signature"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".json.tmp")
+    raw_ocr = [
+        {
+            "id": f"text-{index:04d}",
+            "text": item.text,
+            "rawText": item.raw_text,
+            "score": round(float(item.score), 5),
+            "bounds": [item.left, item.top, item.right, item.bottom],
+        }
+        for index, item in enumerate(page_map.get("ocrItems") or [])
+    ]
+    payload = {
+        "schemaVersion": 3,
+        "signature": page_map["signature"],
+        "targets": page_map["targets"],
+        "targetDetails": page_map.get("targetDetails", {}),
+        "rawOcr": raw_ocr,
+        "regions": page_map.get("regions", []),
+        "relationships": page_map.get("relationships", []),
+        "visualCandidates": page_map.get("visualCandidates", []),
+        "unclassified": page_map.get("unclassified", []),
+    }
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
     )
+    temporary.replace(path)
+    visual_image = page_map.get("visualImage")
+    reference = visual_reference_path(page_map["signature"])
+    if isinstance(visual_image, Image.Image):
+        visual_image.save(reference)
+
+
+def load_visual_model(signature: dict[str, Any]) -> dict[str, Any]:
+    path = visual_map_path(signature)
+    if not path.is_file():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, dict) or value.get("signature") != signature:
+        return {}
+    return value
+
+
+def build_ocr_regions(items: list[Any]) -> list[dict[str, Any]]:
+    """Keep coarse text bands so later classifiers retain page structure."""
+
+    if not items:
+        return []
+    item_ids = {id(item): f"text-{index:04d}" for index, item in enumerate(items)}
+    ordered = sorted(items, key=lambda item: (item.top, item.left))
+    bands: list[list[Any]] = []
+    for item in ordered:
+        if not bands or item.top > max(row.bottom for row in bands[-1]) + 35:
+            bands.append([item])
+        else:
+            bands[-1].append(item)
+    return [
+        {
+            "id": f"region-{index:03d}",
+            "bounds": [
+                min(item.left for item in band),
+                min(item.top for item in band),
+                max(item.right for item in band),
+                max(item.bottom for item in band),
+            ],
+            "textIds": [item_ids[id(item)] for item in band],
+        }
+        for index, band in enumerate(bands)
+    ]
+
+
+def build_ocr_relationships(items: list[Any]) -> list[dict[str, Any]]:
+    """Record nearest spatial neighbors without assigning business semantics."""
+
+    relationships: list[dict[str, Any]] = []
+    for index, item in enumerate(items):
+        center_x = (item.left + item.right) / 2
+        center_y = (item.top + item.bottom) / 2
+        candidates: dict[str, tuple[float, int]] = {}
+        for other_index, other in enumerate(items):
+            if other_index == index:
+                continue
+            other_x = (other.left + other.right) / 2
+            other_y = (other.top + other.bottom) / 2
+            dx, dy = other_x - center_x, other_y - center_y
+            if abs(dx) >= abs(dy):
+                direction = "right" if dx > 0 else "left"
+            else:
+                direction = "below" if dy > 0 else "above"
+            distance = (dx * dx + dy * dy) ** 0.5
+            if direction not in candidates or distance < candidates[direction][0]:
+                candidates[direction] = (distance, other_index)
+        for direction, (distance, other_index) in candidates.items():
+            relationships.append(
+                {
+                    "from": f"text-{index:04d}",
+                    "to": f"text-{other_index:04d}",
+                    "relation": direction,
+                    "distance": round(distance, 2),
+                }
+            )
+    return relationships
+
+
+def get_visual_page_map(
+    context: ExecutionContext,
+    window: Any,
+    page: str = "current-page",
+) -> dict[str, Any]:
+    signature = visual_window_signature(window, page)
+    maps = context.state.setdefault("visual_page_maps", {})
+    cache_key = json.dumps(signature, ensure_ascii=False, sort_keys=True)
+    page_map = maps.get(cache_key)
+    if isinstance(page_map, dict):
+        return page_map
+    persisted = load_visual_model(signature)
+    persisted_details = persisted.get("targetDetails", {})
+    persisted_regions = persisted.get("regions", [])
+    persisted_relationships = persisted.get("relationships", [])
+    persisted_candidates = persisted.get("visualCandidates", [])
+    persisted_unclassified = persisted.get("unclassified", [])
+    persisted_raw_ocr = persisted.get("rawOcr", [])
+    page_map = {
+        "signature": signature,
+        "targets": load_visual_targets(signature),
+        "targetDetails": persisted_details if isinstance(persisted_details, dict) else {},
+        "ocrItems": None,
+        "visualImage": None,
+        "regions": persisted_regions if isinstance(persisted_regions, list) else [],
+        "relationships": persisted_relationships if isinstance(persisted_relationships, list) else [],
+        "visualCandidates": persisted_candidates if isinstance(persisted_candidates, list) else [],
+        "unclassified": persisted_unclassified if isinstance(persisted_unclassified, list) else [],
+        "persistedRawOcr": persisted_raw_ocr if isinstance(persisted_raw_ocr, list) else [],
+    }
+    maps[cache_key] = page_map
+    return page_map
+
+
+def ensure_visual_ocr(
+    context: ExecutionContext,
+    window: Any,
+    page_map: dict[str, Any],
+) -> list[Any]:
+    items = page_map.get("ocrItems")
+    visual_image = page_map.get("visualImage")
+    if isinstance(items, list) and isinstance(visual_image, Image.Image):
+        return items
+
+    persisted_raw = page_map.get("persistedRawOcr")
+    reference_path = visual_reference_path(page_map["signature"])
+    if isinstance(persisted_raw, list) and persisted_raw and reference_path.is_file():
+        restored: list[Any] = []
+        for raw in persisted_raw:
+            if not isinstance(raw, dict):
+                continue
+            bounds = raw.get("bounds")
+            if not (
+                isinstance(bounds, list)
+                and len(bounds) == 4
+                and all(isinstance(value, int) for value in bounds)
+            ):
+                continue
+            restored.append(
+                marker.OcrItem(
+                    text=str(raw.get("text") or ""),
+                    score=float(raw.get("score") or 0),
+                    left=bounds[0],
+                    top=bounds[1],
+                    right=bounds[2],
+                    bottom=bounds[3],
+                    raw_text=str(raw.get("rawText") or ""),
+                )
+            )
+        if restored:
+            with Image.open(reference_path) as reference:
+                page_map["visualImage"] = reference.convert("RGB")
+            page_map["ocrItems"] = restored
+            return restored
+
     rect = window.rectangle()
-    x_offset = 180 if action_column == 1 else 70
-    x = round(rect.right - x_offset * scale)
-    y = round(hospitalization_y + (action_row - 3) * patient_query_row_step(window, scale))
-    return x, y
-
-
-def patient_query_checkbox_point(window: Any, checkbox_name: str) -> tuple[int, int]:
-    """Locate a patient-type checkbox beside the patient query form."""
-
-    if checkbox_name not in PATIENT_QUERY_CHECKBOXES:
-        raise WorkflowExecutionError(
-            f"勾选框“{checkbox_name}”未被 UIA 识别，也没有可用的布局坐标"
-        )
-    row = PATIENT_QUERY_CHECKBOXES[checkbox_name]
-    _hospitalization_x, hospitalization_y, scale = patient_query_field_point(
-        window, "住院号"
+    screenshot_path = context.output_dir / (
+        f".visual_map_{context.state['timestamp']}_{time.time_ns()}.png"
     )
+    try:
+        with ImageGrab.grab(
+            bbox=(rect.left, rect.top, rect.right, rect.bottom)
+        ) as screenshot:
+            visual_image = screenshot.convert("RGB")
+            visual_image.save(screenshot_path)
+        engine = context.state.get("ocr_engine")
+        if engine is None:
+            engine = marker.create_ocr_engine()
+            context.state["ocr_engine"] = engine
+        items = marker.run_ocr(engine, screenshot_path)
+    finally:
+        try:
+            screenshot_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    page_map["ocrItems"] = items
+    page_map["visualImage"] = visual_image
+    page_map["regions"] = build_ocr_regions(items)
+    page_map["relationships"] = build_ocr_relationships(items)
+    page_map["unclassified"] = [
+        f"text-{index:04d}" for index in range(len(items))
+    ]
+    save_visual_targets(page_map)
+    context.emit(
+        "info",
+        f"已识别当前页面并建立视觉元素地图，共发现 {len(items)} 段文字",
+        None,
+    )
+    return items
+
+
+def local_point_to_screen(window: Any, point: list[int]) -> tuple[int, int]:
     rect = window.rectangle()
-    width = rect.right - rect.left
-    x = round(rect.left + width * 0.739)
-    y = round(hospitalization_y + (row - 3) * patient_query_row_step(window, scale))
-    return x, y
+    return rect.left + int(point[0]), rect.top + int(point[1])
+
+
+def visual_text_point(
+    context: ExecutionContext,
+    window: Any,
+    target_name: str,
+    contains: bool = False,
+    page: str = "current-page",
+    role: str = "button",
+) -> tuple[int, int] | None:
+    """Resolve visible text from a reusable per-page visual element map."""
+
+    page_map = get_visual_page_map(context, window, page)
+    target_key = f"{role}:{'contains' if contains else 'exact'}:{target_name}"
+    cached = page_map["targets"].get(target_key)
+    if cached is not None:
+        return local_point_to_screen(window, cached)
+
+    items = ensure_visual_ocr(context, window, page_map)
+    target = marker.normalize_ocr_text(target_name)
+    if not target:
+        return None
+    exact_matches = [item for item in items if item.text == target]
+    matches = exact_matches
+    if not matches and contains:
+        matches = [item for item in items if target in item.text]
+    if not matches:
+        return None
+
+    match = min(
+        matches,
+        key=lambda item: (len(item.text), -item.score, item.top, item.left),
+    )
+    local_point = [
+        (match.left + match.right) // 2,
+        (match.top + match.bottom) // 2,
+    ]
+    page_map["targets"][target_key] = local_point
+    page_map["targetDetails"][target_key] = {
+        "role": role,
+        "name": target_name,
+        "bounds": [match.left, match.top, match.right, match.bottom],
+        "clickPoint": local_point,
+        "matchMode": "contains" if contains else "exact",
+        "confidence": round(float(match.score), 5),
+        "source": "ocr",
+    }
+    save_visual_targets(page_map)
+    return local_point_to_screen(window, local_point)
+
+
+def visual_input_point(
+    context: ExecutionContext,
+    window: Any,
+    field_name: str,
+    page: str = "current-page",
+) -> tuple[int, int] | None:
+    """Infer a painted input area below its label and cache the relative point."""
+
+    page_map = get_visual_page_map(context, window, page)
+    target_key = f"input:{field_name}"
+    cached = page_map["targets"].get(target_key)
+    if cached is not None:
+        return local_point_to_screen(window, cached)
+
+    items = ensure_visual_ocr(context, window, page_map)
+    target = marker.normalize_ocr_text(field_name)
+    labels = [item for item in items if item.text == target]
+    if not labels:
+        return None
+
+    visual_image = page_map.get("visualImage")
+    if not isinstance(visual_image, Image.Image):
+        return None
+    detected: list[tuple[Any, dict[str, Any]]] = []
+    for label in labels:
+        rectangle = find_input_rectangle(visual_image, label)
+        if rectangle is not None:
+            detected.append((label, rectangle))
+    if not detected:
+        return None
+    label, rectangle = max(detected, key=lambda pair: pair[1]["score"])
+    local_point = list(rectangle["center"])
+    page_map["targets"][target_key] = local_point
+    page_map["targetDetails"][target_key] = {
+        "role": "input",
+        "name": field_name,
+        "bounds": rectangle["bounds"],
+        "clickPoint": local_point,
+        "labelBounds": [label.left, label.top, label.right, label.bottom],
+        "relation": rectangle["relation"],
+        "confidence": rectangle["score"],
+        "source": "ocr+shape",
+    }
+    page_map["visualCandidates"].append(
+        {
+            "id": f"rectangle-{len(page_map['visualCandidates']):04d}",
+            "kind": "light-rectangle",
+            "bounds": rectangle["bounds"],
+            "score": rectangle["score"],
+        }
+    )
+    save_visual_targets(page_map)
+    return local_point_to_screen(window, local_point)
+
+
+def visual_select_point(
+    context: ExecutionContext,
+    window: Any,
+    field_name: str,
+    page: str = "current-page",
+) -> tuple[int, int] | None:
+    """Locate a visually rendered select/combo box by its label."""
+
+    page_map = get_visual_page_map(context, window, page)
+    target_key = f"select:{field_name}"
+    cached = page_map["targets"].get(target_key)
+    if cached is not None:
+        return local_point_to_screen(window, cached)
+    items = ensure_visual_ocr(context, window, page_map)
+    target = marker.normalize_ocr_text(field_name)
+    labels = [item for item in items if item.text == target]
+    visual_image = page_map.get("visualImage")
+    if not labels or not isinstance(visual_image, Image.Image):
+        return None
+    detected: list[tuple[Any, dict[str, Any]]] = []
+    for label in labels:
+        rectangle = find_input_rectangle(visual_image, label)
+        if rectangle is not None:
+            detected.append((label, rectangle))
+    if not detected:
+        return None
+    label, rectangle = max(detected, key=lambda pair: pair[1]["score"])
+    local_point = list(rectangle["center"])
+    page_map["targets"][target_key] = local_point
+    page_map["targetDetails"][target_key] = {
+        "role": "select",
+        "name": field_name,
+        "bounds": rectangle["bounds"],
+        "clickPoint": local_point,
+        "labelBounds": [label.left, label.top, label.right, label.bottom],
+        "relation": rectangle["relation"],
+        "confidence": rectangle["score"],
+        "source": "ocr+shape",
+    }
+    save_visual_targets(page_map)
+    return local_point_to_screen(window, local_point)
+
+
+def visual_checkbox_point(
+    context: ExecutionContext,
+    window: Any,
+    checkbox_name: str,
+    page: str = "current-page",
+) -> tuple[int, int] | None:
+    """Locate a painted checkbox around its label without assuming direction."""
+
+    page_map = get_visual_page_map(context, window, page)
+    target_key = f"checkbox:{checkbox_name}"
+    cached = page_map["targets"].get(target_key)
+    if cached is not None:
+        return local_point_to_screen(window, cached)
+
+    items = ensure_visual_ocr(context, window, page_map)
+    target = marker.normalize_ocr_text(checkbox_name)
+    labels = [item for item in items if item.text == target]
+    if not labels:
+        return None
+
+    visual_image = page_map.get("visualImage")
+    if not isinstance(visual_image, Image.Image):
+        return None
+    detected: list[tuple[Any, dict[str, Any]]] = []
+    for label in labels:
+        square = find_checkbox_square(visual_image, label)
+        if square is not None:
+            detected.append((label, square))
+    if not detected:
+        return None
+    label, square = max(detected, key=lambda pair: pair[1]["score"])
+    local_point = list(square["center"])
+    page_map["targets"][target_key] = local_point
+    page_map["targetDetails"][target_key] = {
+        "role": "checkbox",
+        "name": checkbox_name,
+        "bounds": square["bounds"],
+        "clickPoint": local_point,
+        "labelBounds": [label.left, label.top, label.right, label.bottom],
+        "relation": square["relation"],
+        "confidence": square["score"],
+        "source": "ocr+shape",
+    }
+    page_map["visualCandidates"].append(
+        {
+            "id": f"square-{len(page_map['visualCandidates']):04d}",
+            "kind": "square",
+            "bounds": square["bounds"],
+            "score": square["score"],
+        }
+    )
+    save_visual_targets(page_map)
+    return local_point_to_screen(window, local_point)
 
 
 def visual_checkbox_state(point: tuple[int, int]) -> bool:
@@ -274,8 +685,21 @@ def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> di
         raise WorkflowExecutionError(f"字段“{field_name}”的填写内容不能为空")
 
     window = current_window(context)
-    control = find_his_edit_control(window, field_name, timeout)
-    if control is not None:
+    point = visual_input_point(
+        context,
+        window,
+        field_name,
+        page=visual_page_id(params),
+    )
+    if point is not None:
+        mouse.click(button="left", coords=point)
+        locator_mode = "visual-map"
+    else:
+        control = find_his_edit_control(window, field_name, timeout)
+        if control is None:
+            raise WorkflowExecutionError(
+                f"视觉页面布局中未找到字段“{field_name}”，UIA 也无法识别该字段"
+            )
         control.click_input()
         locator_mode = "uia-control"
         rect = control.rectangle()
@@ -283,11 +707,6 @@ def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> di
             rect.left + (rect.right - rect.left) // 2,
             rect.top + (rect.bottom - rect.top) // 2,
         )
-    else:
-        x, y, _scale = patient_query_field_point(window, field_name)
-        mouse.click(button="left", coords=(x, y))
-        locator_mode = "responsive-grid"
-        point = (x, y)
 
     time.sleep(0.15)
     send_keys("^a", pause=0.06)
@@ -326,8 +745,34 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
         raise WorkflowExecutionError(f"下拉框“{field_name}”的目标选项不能为空")
 
     window = current_window(context)
-    control = find_named_his_control(window, field_name, {"ComboBox"}, timeout)
-    if control is not None:
+    page = visual_page_id(params)
+    point = visual_select_point(context, window, field_name, page=page)
+    if point is not None:
+        mouse.click(button="left", coords=point)
+        context.wait(0.25)
+        option_page = f"{page}:expanded:{field_name}"[:80]
+        option_point = visual_text_point(
+            context,
+            window,
+            option_text,
+            contains=False,
+            page=option_page,
+            role="option",
+        )
+        if option_point is not None:
+            mouse.click(button="left", coords=option_point)
+            locator_mode = "visual-map"
+        else:
+            send_keys("{HOME}", pause=0.06)
+            send_keys(option_text, pause=0.08)
+            send_keys("{ENTER}", pause=0.06)
+            locator_mode = "visual-map-keyboard"
+    else:
+        control = find_named_his_control(window, field_name, {"ComboBox"}, timeout)
+        if control is None:
+            raise WorkflowExecutionError(
+                f"视觉页面布局中未找到下拉框“{field_name}”，UIA 也无法识别该控件"
+            )
         try:
             control.select(option_text)
         except Exception:
@@ -338,14 +783,6 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
         locator_mode = "uia-control"
         rect = control.rectangle()
         point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
-    else:
-        x, y, _scale = patient_query_field_point(window, field_name)
-        mouse.click(button="left", coords=(x, y))
-        send_keys("{HOME}", pause=0.06)
-        send_keys(option_text, pause=0.08)
-        send_keys("{ENTER}", pause=0.06)
-        locator_mode = "responsive-grid"
-        point = (x, y)
 
     context.emit(
         "info",
@@ -370,8 +807,28 @@ def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> d
         raise WorkflowExecutionError("勾选框目标状态无效")
 
     window = current_window(context)
-    control = find_named_his_control(window, checkbox_name, {"CheckBox"}, timeout)
-    if control is not None:
+    point = visual_checkbox_point(
+        context,
+        window,
+        checkbox_name,
+        page=visual_page_id(params),
+    )
+    if point is not None:
+        locator_mode = "visual-map"
+        current_state = visual_checkbox_state(point)
+        should_click = (
+            target_state == "切换"
+            or (target_state == "勾选" and not current_state)
+            or (target_state == "取消勾选" and current_state)
+        )
+        if should_click:
+            mouse.click(button="left", coords=point)
+    else:
+        control = find_named_his_control(window, checkbox_name, {"CheckBox"}, timeout)
+        if control is None:
+            raise WorkflowExecutionError(
+                f"视觉页面布局中未找到勾选框“{checkbox_name}”，UIA 也无法识别该控件"
+            )
         try:
             current_state = bool(control.get_toggle_state())
         except Exception:
@@ -386,18 +843,6 @@ def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> d
         )
         if should_click:
             control.click_input()
-    else:
-        point = patient_query_checkbox_point(window, checkbox_name)
-        current_state = visual_checkbox_state(point)
-        locator_mode = "visual-responsive-grid"
-        should_click = (
-            target_state == "切换"
-            or (target_state == "勾选" and not current_state)
-            or (target_state == "取消勾选" and current_state)
-        )
-        if should_click:
-            mouse.click(button="left", coords=point)
-
     final_state = not current_state if should_click else current_state
     context.emit(
         "info",
@@ -437,22 +882,32 @@ def run_his_click_object(context: ExecutionContext, params: dict[str, Any]) -> d
 
     window = current_window(context)
     control_types = allowed_types if control_type == "自动" else {control_type}
-    control = find_named_his_control(
+    point = visual_text_point(
+        context,
         window,
         target_name,
-        control_types,
-        timeout,
         contains=match_mode == "包含文字",
+        page=visual_page_id(params),
     )
-    if control is not None:
+    if point is not None:
+        mouse.click(button="left", coords=point)
+        locator_mode = "visual-map"
+    else:
+        control = find_named_his_control(
+            window,
+            target_name,
+            control_types,
+            timeout,
+            contains=match_mode == "包含文字",
+        )
+        if control is None:
+            raise WorkflowExecutionError(
+                f"视觉页面布局中未找到对象“{target_name}”，UIA 也无法识别该对象"
+            )
         control.click_input()
         rect = control.rectangle()
         point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
         locator_mode = "uia-control"
-    else:
-        point = patient_query_action_point(window, target_name)
-        mouse.click(button="left", coords=point)
-        locator_mode = "responsive-grid"
 
     context.emit(
         "info",
@@ -476,7 +931,36 @@ def run_his_input_number(context: ExecutionContext, params: dict[str, Any]) -> d
     marker.base.HOSPITALIZATION_NUMBER = number
     context.variables["hospitalization_number"] = number
     window = current_window(context)
-    point, locator_mode = his.enter_hospitalization_number(window)
+    point = visual_input_point(
+        context,
+        window,
+        "住院号",
+        page=visual_page_id(params),
+    )
+    if point is not None:
+        mouse.click(button="left", coords=point)
+        locator_mode = "visual-map"
+    else:
+        control = find_his_edit_control(window, "住院号", 5.0)
+        if control is None:
+            raise WorkflowExecutionError(
+                "视觉页面布局中未找到住院号输入框，UIA 也无法识别该字段"
+            )
+        control.click_input()
+        rect = control.rectangle()
+        point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
+        locator_mode = "uia-control"
+    time.sleep(0.15)
+    send_keys("^a", pause=0.06)
+    send_keys("{BACKSPACE}", pause=0.06)
+    send_keys(number, pause=0.08)
+    time.sleep(0.2)
+    send_keys("{ENTER}", pause=0.08)
+    context.emit(
+        "info",
+        f"已填写住院号并按回车；定位方式={locator_mode}",
+        None,
+    )
     return {"value": number, "locatorMode": locator_mode, "point": list(point)}
 
 
@@ -1484,6 +1968,90 @@ def run_ocr_mark(context: ExecutionContext, params: dict[str, Any]) -> dict[str,
     return {"paths": outputs, "found": sorted(all_found), "missing": missing}
 
 
+def run_visual_map_page(
+    context: ExecutionContext,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Build or load a reusable visual model for the current application page."""
+
+    window = current_window(context)
+    page = visual_page_id(params)
+    page_map = get_visual_page_map(context, window, page)
+    if bool(params.get("forceRefresh", False)):
+        page_map.update(
+            {
+                "targets": {},
+                "targetDetails": {},
+                "ocrItems": None,
+                "visualImage": None,
+                "regions": [],
+                "relationships": [],
+                "visualCandidates": [],
+                "unclassified": [],
+                "persistedRawOcr": [],
+            }
+        )
+    items = ensure_visual_ocr(context, window, page_map)
+    path = visual_map_path(page_map["signature"])
+    return {
+        "page": page,
+        "layoutPath": str(path),
+        "textCount": len(items),
+        "regionCount": len(page_map.get("regions", [])),
+        "relationshipCount": len(page_map.get("relationships", [])),
+    }
+
+
+def run_visual_hover_object(
+    context: ExecutionContext,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Hover a named object and capture the resulting menu/popover page state."""
+
+    target_name = str(params.get("targetName") or "").strip()
+    if not target_name:
+        raise WorkflowExecutionError("悬浮对象名称不能为空")
+    timeout = float(params.get("timeoutSeconds", 5))
+    wait_seconds = float(params.get("hoverWaitSeconds", 0.5))
+    if not 0 <= wait_seconds <= 10:
+        raise WorkflowExecutionError("悬浮后等待时间必须在 0～10 秒之间")
+    source_page = visual_page_id(params)
+    hover_page = str(
+        params.get("hoverPage") or f"{source_page}:hover:{target_name}"
+    ).strip()[:80]
+    window = current_window(context)
+    point = visual_text_point(
+        context,
+        window,
+        target_name,
+        page=source_page,
+        role="hover-trigger",
+    )
+    if point is not None:
+        locator_mode = "visual-map"
+    else:
+        control = find_named_his_control(window, target_name, None, timeout)
+        if control is None:
+            raise WorkflowExecutionError(
+                f"无法在视觉页面布局或 UIA 中找到悬浮对象“{target_name}”"
+            )
+        rect = control.rectangle()
+        point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
+        locator_mode = "uia-control"
+    mouse.move(coords=point)
+    context.wait(wait_seconds)
+    hover_map = get_visual_page_map(context, window, hover_page)
+    hover_items = ensure_visual_ocr(context, window, hover_map)
+    return {
+        "targetName": target_name,
+        "point": list(point),
+        "locatorMode": locator_mode,
+        "hoverPage": hover_page,
+        "layoutPath": str(visual_map_path(hover_map["signature"])),
+        "visibleTextCount": len(hover_items),
+    }
+
+
 def run_wait(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
     seconds = float(params.get("seconds", 1.0))
     if not 0 <= seconds <= 120:
@@ -1552,6 +2120,31 @@ def build_registry() -> WorkflowRegistry:
             run_window_maximize,
         ),
         ModuleDefinition(
+            "visual.map_page",
+            "识别并保存当前页面布局",
+            "视觉",
+            "首次截图并建立通用页面模型；已有匹配模型时直接加载。",
+            (
+                visual_page_field(),
+                field("forceRefresh", "强制重新识别", "boolean", False),
+            ),
+            run_visual_map_page,
+        ),
+        ModuleDefinition(
+            "visual.hover_object",
+            "悬浮对象并识别展开布局",
+            "视觉",
+            "悬浮到命名对象上，并将出现的菜单或弹出层保存为独立页面状态。",
+            (
+                field("targetName", "悬浮对象名称", "text", ""),
+                visual_page_field(),
+                field("hoverPage", "展开状态页面标识", "text", ""),
+                field("hoverWaitSeconds", "悬浮后等待（秒）", "number", 0.5, min=0, max=10, step=0.1),
+                field("timeoutSeconds", "UIA 查找超时（秒）", "number", 5, min=0, max=60, step=1),
+            ),
+            run_visual_hover_object,
+        ),
+        ModuleDefinition(
             "his.input_field",
             "填写 HIS 字段并回车",
             "HIS",
@@ -1560,6 +2153,7 @@ def build_registry() -> WorkflowRegistry:
                 field("fieldName", "目标字段名称", "text", "卡号"),
                 field("value", "填写内容/变量", "text", ""),
                 field("pressEnter", "填写后按回车", "boolean", True),
+                visual_page_field(),
                 field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
             ),
             run_his_input_field,
@@ -1572,6 +2166,7 @@ def build_registry() -> WorkflowRegistry:
             (
                 field("fieldName", "下拉框字段名称", "text", "性别"),
                 field("optionText", "选择内容/变量", "text", "全部"),
+                visual_page_field(),
                 field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
             ),
             run_his_select_option,
@@ -1590,6 +2185,7 @@ def build_registry() -> WorkflowRegistry:
                     "勾选",
                     options=["勾选", "取消勾选", "切换"],
                 ),
+                visual_page_field(),
                 field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
             ),
             run_his_set_checkbox,
@@ -1624,6 +2220,7 @@ def build_registry() -> WorkflowRegistry:
                     "精确匹配",
                     options=["精确匹配", "包含文字"],
                 ),
+                visual_page_field(),
                 field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
             ),
             run_his_click_object,
@@ -1633,7 +2230,10 @@ def build_registry() -> WorkflowRegistry:
             "填写住院号并回车",
             "HIS",
             "优先使用 UIA，失败时沿用已验证的相对布局定位。",
-            (field("value", "住院号/变量", "text", "${hospitalization_number}"),),
+            (
+                field("value", "住院号/变量", "text", "${hospitalization_number}"),
+                visual_page_field(),
+            ),
             run_his_input_number,
         ),
         ModuleDefinition(

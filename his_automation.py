@@ -53,6 +53,7 @@ enable_dpi_awareness()
 from mss import MSS
 from PIL import Image
 from pywinauto import Desktop, mouse
+from pywinauto.controls.hwndwrapper import HwndWrapper
 from pywinauto.keyboard import send_keys
 
 
@@ -69,29 +70,70 @@ def normalize_text(value: object) -> str:
 
 
 def activate_his_window() -> object:
-    """恢复并置前 HIS 顶层窗口。"""
+    """按标题连接并置前顶层窗口，不要求其 UIA 类型必须为 Window。"""
 
-    window = Desktop(backend="uia").window(
-        title=WINDOW_TITLE,
-        control_type="Window",
-    )
-    if not window.exists(timeout=5):
+    desktop = Desktop(backend="uia")
+    deadline = time.monotonic() + 5.0
+    available: list[str] = []
+    wrapper: object | None = None
+
+    while True:
+        top_level_items = desktop.windows()
         available = sorted(
             {
                 normalize_text(item.window_text())
-                for item in Desktop(backend="uia").windows()
+                for item in top_level_items
                 if normalize_text(item.window_text())
             }
         )
+        matches = [
+            item
+            for item in top_level_items
+            if normalize_text(item.window_text()) == WINDOW_TITLE
+        ]
+        if matches:
+            # 普通应用通常暴露为 Window；完全自绘、没有 UIA 控件树的
+            # 顶层窗口可能只暴露为 Pane。两者都属于可连接的顶层对象。
+            type_priority = {"Window": 0, "Pane": 1}
+            wrapper = min(
+                matches,
+                key=lambda item: type_priority.get(
+                    str(getattr(item.element_info, "control_type", "") or ""),
+                    2,
+                ),
+            )
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.2)
+
+    if wrapper is None:
         raise RuntimeError(
             f"找不到窗口 {WINDOW_TITLE!r}；当前顶层窗口={available}"
         )
-    wrapper = window.wrapper_object()
-    if wrapper.is_minimized():
-        wrapper.restore()
+
+    hwnd = int(getattr(wrapper, "handle", 0) or 0)
+    if not hwnd:
+        raise RuntimeError(f"窗口 {WINDOW_TITLE!r} 没有可用的顶层句柄")
+
+    user32 = ctypes.windll.user32
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         time.sleep(0.5)
-    wrapper.set_focus()
+
+    # UIAWrapper.set_focus() 对没有 UIA Provider 的顶层 Pane 只尝试 UIA
+    # SetFocus，可能没有异常却也不改变窗口 Z 序。这里始终通过真实 HWND
+    # 执行顶层窗口置前，同时仍返回 UIA wrapper 供后续控件查找使用。
+    try:
+        HwndWrapper(hwnd).set_focus()
+    except Exception:
+        user32.ShowWindow(hwnd, 5)  # SW_SHOW
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+
     time.sleep(0.4)
+    if int(user32.GetForegroundWindow() or 0) != hwnd:
+        raise RuntimeError(f"已连接窗口 {WINDOW_TITLE!r}，但未能将其置于前台")
     return wrapper
 
 
