@@ -187,7 +187,7 @@ def visual_window_signature(window: Any, page: str) -> dict[str, Any]:
     if width <= 0 or height <= 0:
         raise WorkflowExecutionError("目标窗口没有有效的屏幕区域")
     return {
-        "locatorVersion": 3,
+        "locatorVersion": 4,
         "page": page,
         "windowTitle": his.normalize_text(window.window_text()),
         "className": str(getattr(window.element_info, "class_name", "") or ""),
@@ -246,10 +246,12 @@ def save_visual_targets(page_map: dict[str, Any]) -> None:
         for index, item in enumerate(page_map.get("ocrItems") or [])
     ]
     payload = {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "signature": page_map["signature"],
         "targets": page_map["targets"],
         "targetDetails": page_map.get("targetDetails", {}),
+        "elements": page_map.get("elements", []),
+        "ambiguousTargets": page_map.get("ambiguousTargets", {}),
         "rawOcr": raw_ocr,
         "regions": page_map.get("regions", []),
         "relationships": page_map.get("relationships", []),
@@ -341,6 +343,171 @@ def build_ocr_relationships(items: list[Any]) -> list[dict[str, Any]]:
     return relationships
 
 
+def classify_visual_page(page_map: dict[str, Any]) -> None:
+    """Classify the complete OCR page once and persist reusable control targets.
+
+    Classification stays application-neutral. A painted rectangle linked to a
+    label is recorded as a field candidate that may be used by either an input
+    or select action; the workflow action supplies the final semantic intent.
+    Every OCR occurrence is retained, including duplicate labels that cannot be
+    safely collapsed into one click target.
+    """
+
+    items = page_map.get("ocrItems")
+    image = page_map.get("visualImage")
+    if not isinstance(items, list) or not isinstance(image, Image.Image):
+        return
+
+    elements: list[dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
+    occurrences: dict[str, list[int]] = {}
+    resolved_text_ids: set[str] = set()
+
+    for index, item in enumerate(items):
+        element_id = f"text-{index:04d}"
+        normalized = marker.normalize_ocr_text(item.text)
+        occurrences.setdefault(normalized, []).append(index)
+        elements.append(
+            {
+                "id": element_id,
+                "kind": "text",
+                "text": item.text,
+                "rawText": item.raw_text,
+                "bounds": [item.left, item.top, item.right, item.bottom],
+                "center": [
+                    (item.left + item.right) // 2,
+                    (item.top + item.bottom) // 2,
+                ],
+                "confidence": round(float(item.score), 5),
+                "possibleRoles": ["text", "button", "tab", "menu-item", "link"],
+            }
+        )
+
+    ambiguous: dict[str, list[str]] = {}
+    for normalized, indexes in occurrences.items():
+        if not normalized:
+            continue
+        ids = [f"text-{index:04d}" for index in indexes]
+        if len(indexes) > 1:
+            ambiguous[normalized] = ids
+            continue
+        index = indexes[0]
+        item = items[index]
+        point = [(item.left + item.right) // 2, (item.top + item.bottom) // 2]
+        key = f"button:exact:{item.text}"
+        page_map["targets"].setdefault(key, point)
+        page_map["targetDetails"].setdefault(
+            key,
+            {
+                "role": "text-action",
+                "possibleRoles": ["button", "tab", "menu-item", "link", "text"],
+                "name": item.text,
+                "bounds": [item.left, item.top, item.right, item.bottom],
+                "clickPoint": point,
+                "matchMode": "exact",
+                "confidence": round(float(item.score), 5),
+                "source": "ocr-page-classifier",
+            },
+        )
+
+    for index, label in enumerate(items):
+        normalized = marker.normalize_ocr_text(label.text)
+        if not normalized:
+            continue
+        label_id = f"text-{index:04d}"
+        unique_label = len(occurrences.get(normalized, [])) == 1
+
+        rectangle = find_input_rectangle(image, label)
+        if rectangle is not None:
+            candidate_id = f"field-{len(candidates):04d}"
+            candidate = {
+                "id": candidate_id,
+                "kind": "field-rectangle",
+                "possibleRoles": ["input", "select"],
+                "labelText": label.text,
+                "labelId": label_id,
+                "bounds": rectangle["bounds"],
+                "center": rectangle["center"],
+                "relation": rectangle["relation"],
+                "score": rectangle["score"],
+            }
+            candidates.append(candidate)
+            elements.append(candidate)
+            resolved_text_ids.add(label_id)
+            if unique_label:
+                for role in ("input", "select"):
+                    key = f"{role}:{label.text}"
+                    page_map["targets"].setdefault(key, list(rectangle["center"]))
+                    page_map["targetDetails"].setdefault(
+                        key,
+                        {
+                            "role": "field",
+                            "possibleRoles": ["input", "select"],
+                            "name": label.text,
+                            "bounds": rectangle["bounds"],
+                            "clickPoint": rectangle["center"],
+                            "labelBounds": [
+                                label.left,
+                                label.top,
+                                label.right,
+                                label.bottom,
+                            ],
+                            "relation": rectangle["relation"],
+                            "confidence": rectangle["score"],
+                            "source": "ocr-page-classifier",
+                        },
+                    )
+
+        square = find_checkbox_square(image, label)
+        if square is not None:
+            candidate_id = f"checkbox-{len(candidates):04d}"
+            candidate = {
+                "id": candidate_id,
+                "kind": "checkbox",
+                "possibleRoles": ["checkbox", "toggle"],
+                "labelText": label.text,
+                "labelId": label_id,
+                "bounds": square["bounds"],
+                "center": square["center"],
+                "relation": square["relation"],
+                "score": square["score"],
+            }
+            candidates.append(candidate)
+            elements.append(candidate)
+            resolved_text_ids.add(label_id)
+            if unique_label:
+                key = f"checkbox:{label.text}"
+                page_map["targets"].setdefault(key, list(square["center"]))
+                page_map["targetDetails"].setdefault(
+                    key,
+                    {
+                        "role": "checkbox",
+                        "possibleRoles": ["checkbox", "toggle"],
+                        "name": label.text,
+                        "bounds": square["bounds"],
+                        "clickPoint": square["center"],
+                        "labelBounds": [
+                            label.left,
+                            label.top,
+                            label.right,
+                            label.bottom,
+                        ],
+                        "relation": square["relation"],
+                        "confidence": square["score"],
+                        "source": "ocr-page-classifier",
+                    },
+                )
+
+    page_map["elements"] = elements
+    page_map["ambiguousTargets"] = ambiguous
+    page_map["visualCandidates"] = candidates
+    page_map["unclassified"] = [
+        f"text-{index:04d}"
+        for index in range(len(items))
+        if f"text-{index:04d}" not in resolved_text_ids
+    ]
+
+
 def get_visual_page_map(
     context: ExecutionContext,
     window: Any,
@@ -354,6 +521,8 @@ def get_visual_page_map(
         return page_map
     persisted = load_visual_model(signature)
     persisted_details = persisted.get("targetDetails", {})
+    persisted_elements = persisted.get("elements", [])
+    persisted_ambiguous = persisted.get("ambiguousTargets", {})
     persisted_regions = persisted.get("regions", [])
     persisted_relationships = persisted.get("relationships", [])
     persisted_candidates = persisted.get("visualCandidates", [])
@@ -363,6 +532,8 @@ def get_visual_page_map(
         "signature": signature,
         "targets": load_visual_targets(signature),
         "targetDetails": persisted_details if isinstance(persisted_details, dict) else {},
+        "elements": persisted_elements if isinstance(persisted_elements, list) else [],
+        "ambiguousTargets": persisted_ambiguous if isinstance(persisted_ambiguous, dict) else {},
         "ocrItems": None,
         "visualImage": None,
         "regions": persisted_regions if isinstance(persisted_regions, list) else [],
@@ -414,6 +585,9 @@ def ensure_visual_ocr(
             with Image.open(reference_path) as reference:
                 page_map["visualImage"] = reference.convert("RGB")
             page_map["ocrItems"] = restored
+            if not page_map.get("elements"):
+                classify_visual_page(page_map)
+                save_visual_targets(page_map)
             return restored
 
     rect = window.rectangle()
@@ -441,13 +615,14 @@ def ensure_visual_ocr(
     page_map["visualImage"] = visual_image
     page_map["regions"] = build_ocr_regions(items)
     page_map["relationships"] = build_ocr_relationships(items)
-    page_map["unclassified"] = [
-        f"text-{index:04d}" for index in range(len(items))
-    ]
+    classify_visual_page(page_map)
     save_visual_targets(page_map)
     context.emit(
         "info",
-        f"已识别当前页面并建立视觉元素地图，共发现 {len(items)} 段文字",
+        (
+            f"已识别当前页面并完成整页控件预分类：{len(items)} 段文字，"
+            f"{len(page_map.get('visualCandidates', []))} 个形状控件候选"
+        ),
         None,
     )
     return items
@@ -1982,6 +2157,8 @@ def run_visual_map_page(
             {
                 "targets": {},
                 "targetDetails": {},
+                "elements": [],
+                "ambiguousTargets": {},
                 "ocrItems": None,
                 "visualImage": None,
                 "regions": [],
@@ -1997,6 +2174,11 @@ def run_visual_map_page(
         "page": page,
         "layoutPath": str(path),
         "textCount": len(items),
+        "elementCount": len(page_map.get("elements", [])),
+        "controlCandidateCount": len(page_map.get("visualCandidates", [])),
+        "reusableTargetCount": len(page_map.get("targets", {})),
+        "ambiguousTargetCount": len(page_map.get("ambiguousTargets", {})),
+        "unclassifiedCount": len(page_map.get("unclassified", [])),
         "regionCount": len(page_map.get("regions", [])),
         "relationshipCount": len(page_map.get("relationships", [])),
     }
