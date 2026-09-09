@@ -20,9 +20,12 @@ from visual_shape_detection import (
     checkbox_bounds_match_label,
     detect_foreground_panel,
     detect_table_regions,
+    detect_visual_control_candidates,
     find_checkbox_square,
     find_input_rectangle,
     input_bounds_match_label,
+    match_checkbox_candidate,
+    match_input_candidate,
 )
 from visual_state import (
     changed_region,
@@ -107,7 +110,26 @@ def run_window_maximize(context: ExecutionContext, params: dict[str, Any]) -> di
     }
 
 
-def find_his_edit_control(window: Any, field_name: str, timeout: float = 5.0) -> Any | None:
+def control_is_within_screen_bounds(control: Any, bounds: list[int] | None) -> bool:
+    if bounds is None:
+        return True
+    try:
+        rect = control.rectangle()
+    except Exception:
+        return False
+    center = [
+        rect.left + (rect.right - rect.left) // 2,
+        rect.top + (rect.bottom - rect.top) // 2,
+    ]
+    return point_is_inside_bounds(center, bounds)
+
+
+def find_his_edit_control(
+    window: Any,
+    field_name: str,
+    timeout: float = 5.0,
+    required_screen_bounds: list[int] | None = None,
+) -> Any | None:
     """Find one visible edit by its accessible field name."""
 
     deadline = time.monotonic() + timeout
@@ -120,6 +142,7 @@ def find_his_edit_control(window: Any, field_name: str, timeout: float = 5.0) ->
                 == field_name
                 and item.is_visible()
                 and item.is_enabled()
+                and control_is_within_screen_bounds(item, required_screen_bounds)
             ]
         except Exception:
             matches = []
@@ -135,6 +158,7 @@ def find_named_his_control(
     control_types: set[str] | None,
     timeout: float,
     contains: bool = False,
+    required_screen_bounds: list[int] | None = None,
 ) -> Any | None:
     """Find a visible HIS control by accessible name and optional control types."""
 
@@ -152,6 +176,7 @@ def find_named_his_control(
                     and (not control_types or item_type in control_types)
                     and item.is_visible()
                     and item.is_enabled()
+                    and control_is_within_screen_bounds(item, required_screen_bounds)
                 ):
                     matches.append(item)
         except Exception:
@@ -281,6 +306,7 @@ def save_visual_targets(page_map: dict[str, Any]) -> None:
         "relationships": page_map.get("relationships", []),
         "visualCandidates": page_map.get("visualCandidates", []),
         "unclassified": page_map.get("unclassified", []),
+        "performance": page_map.get("performance", {}),
     }
     temporary.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
@@ -367,13 +393,14 @@ def build_ocr_relationships(items: list[Any]) -> list[dict[str, Any]]:
     return relationships
 
 
-VISUAL_CLASSIFICATION_VERSION = 2
+VISUAL_CLASSIFICATION_VERSION = 3
 VISUAL_CHECKBOX_LOCATOR_VERSION = 3
 
 
 def classify_visual_page(page_map: dict[str, Any]) -> None:
     """Preclassify a new OCR page once and persist reusable semantic controls."""
 
+    classification_started = time.perf_counter()
     items = page_map.get("ocrItems")
     image = page_map.get("visualImage")
     if not isinstance(items, list) or not isinstance(image, Image.Image):
@@ -384,6 +411,7 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
     occurrences: dict[str, list[int]] = {}
     actionable_occurrences: dict[str, list[int]] = {}
     resolved_text_ids: set[str] = set()
+    primitive_started = time.perf_counter()
     foreground = None if page_map.get("ocrBounds") else detect_foreground_panel(image)
     foreground_bounds = foreground.get("bounds") if foreground else None
     table_regions = [] if page_map.get("ocrBounds") else detect_table_regions(image)
@@ -400,6 +428,31 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
             )
         ]
 
+    ocr_bounds = page_map.get("ocrBounds")
+    if (
+        isinstance(ocr_bounds, list)
+        and len(ocr_bounds) == 4
+        and all(isinstance(value, int) for value in ocr_bounds)
+    ):
+        control_inventory = detect_visual_control_candidates(
+            image.crop(tuple(ocr_bounds))
+        )
+        for group in control_inventory.values():
+            for candidate in group:
+                candidate["bounds"] = [
+                    candidate["bounds"][0] + ocr_bounds[0],
+                    candidate["bounds"][1] + ocr_bounds[1],
+                    candidate["bounds"][2] + ocr_bounds[0],
+                    candidate["bounds"][3] + ocr_bounds[1],
+                ]
+                candidate["center"] = [
+                    candidate["center"][0] + ocr_bounds[0],
+                    candidate["center"][1] + ocr_bounds[1],
+                ]
+    else:
+        control_inventory = detect_visual_control_candidates(image)
+    primitive_seconds = time.perf_counter() - primitive_started
+
     def is_in_foreground(item: Any) -> bool:
         return point_is_inside_bounds(
             [(item.left + item.right) // 2, (item.top + item.bottom) // 2],
@@ -414,6 +467,45 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
             if left <= center_x <= right and top <= center_y <= bottom:
                 return table_index, table
         return None
+
+    def candidate_allowed(candidate: dict[str, Any]) -> bool:
+        if foreground_bounds is not None and not point_is_inside_bounds(
+            candidate.get("center"), foreground_bounds
+        ):
+            return False
+        return not any(
+            point_is_inside_bounds(candidate.get("center"), table["bounds"])
+            for table in table_regions
+        )
+
+    field_candidates = [
+        candidate
+        for candidate in control_inventory.get("fieldRectangles", [])
+        if candidate_allowed(candidate)
+    ]
+    square_candidates = [
+        candidate
+        for candidate in control_inventory.get("squareControls", [])
+        if candidate_allowed(candidate)
+    ]
+    candidates.extend(
+        {
+            "id": f"field-candidate-{index:04d}",
+            "kind": "field-rectangle",
+            "possibleRoles": ["input", "select", "date"],
+            **candidate,
+        }
+        for index, candidate in enumerate(field_candidates)
+    )
+    candidates.extend(
+        {
+            "id": f"square-candidate-{index:04d}",
+            "kind": "square-control",
+            "possibleRoles": ["checkbox", "toggle", "icon"],
+            **candidate,
+        }
+        for index, candidate in enumerate(square_candidates)
+    )
 
     table_first_rows: dict[int, int] = {}
     for index, table in enumerate(table_regions):
@@ -516,7 +608,7 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
         label_id = f"text-{index:04d}"
         unique_label = len(actionable_occurrences.get(normalized, [])) == 1
 
-        rectangle = find_input_rectangle(image, label)
+        rectangle = match_input_candidate(field_candidates, label)
         if rectangle is not None and not any(
             point_is_inside_bounds(rectangle["center"], table["bounds"])
             for table in table_regions
@@ -529,7 +621,6 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
                 "labelId": label_id,
                 **rectangle,
             }
-            candidates.append(candidate)
             elements.append(candidate)
             resolved_text_ids.add(label_id)
             if unique_label:
@@ -548,7 +639,7 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
                         "source": "ocr-page-classifier",
                     }
 
-        square = find_checkbox_square(image, label)
+        square = match_checkbox_candidate(square_candidates, label)
         if square is not None and not any(
             point_is_inside_bounds(square["center"], table["bounds"])
             for table in table_regions
@@ -561,7 +652,6 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
                 "labelId": label_id,
                 **square,
             }
-            candidates.append(candidate)
             elements.append(candidate)
             resolved_text_ids.add(label_id)
             if unique_label:
@@ -611,6 +701,17 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
         if f"text-{index:04d}" not in resolved_text_ids
     ]
     page_map["classificationVersion"] = VISUAL_CLASSIFICATION_VERSION
+    page_map.setdefault("performance", {}).update(
+        {
+            "primitiveDetectionSeconds": round(primitive_seconds, 4),
+            "classificationSeconds": round(
+                time.perf_counter() - classification_started,
+                4,
+            ),
+            "fieldCandidateCount": len(field_candidates),
+            "squareCandidateCount": len(square_candidates),
+        }
+    )
 
 
 def capture_visual_window(window: Any) -> Image.Image:
@@ -619,6 +720,22 @@ def capture_visual_window(window: Any) -> Image.Image:
         bbox=(rect.left, rect.top, rect.right, rect.bottom)
     ) as screenshot:
         return screenshot.convert("RGB")
+
+
+def active_foreground_screen_bounds(window: Any) -> list[int] | None:
+    """Return the active visual dialog in screen coordinates, when present."""
+
+    foreground = detect_foreground_panel(capture_visual_window(window))
+    local_bounds = foreground.get("bounds") if isinstance(foreground, dict) else None
+    if not isinstance(local_bounds, list) or len(local_bounds) != 4:
+        return None
+    rect = window.rectangle()
+    return [
+        rect.left + local_bounds[0],
+        rect.top + local_bounds[1],
+        rect.left + local_bounds[2],
+        rect.top + local_bounds[3],
+    ]
 
 
 def capture_stable_visual_window(
@@ -720,6 +837,34 @@ def visual_page_image(page_map: dict[str, Any]) -> Image.Image | None:
         return None
 
 
+def mapped_foreground_bounds(page_map: dict[str, Any]) -> list[int] | None:
+    """Return the foreground panel recorded by a map, never its live snapshot."""
+
+    for region in page_map.get("regions", []):
+        if not isinstance(region, dict) or region.get("type") != "foreground-dialog":
+            continue
+        bounds = region.get("bounds")
+        if isinstance(bounds, list) and len(bounds) == 4:
+            return bounds
+
+    image = page_map.get("visualImage")
+    if not isinstance(image, Image.Image):
+        signature = page_map.get("signature")
+        if isinstance(signature, dict):
+            reference = visual_reference_path(signature)
+            if reference.is_file():
+                try:
+                    with Image.open(reference) as stored:
+                        image = stored.convert("RGB")
+                except OSError:
+                    image = None
+    if not isinstance(image, Image.Image):
+        return None
+    foreground = detect_foreground_panel(image)
+    bounds = foreground.get("bounds") if isinstance(foreground, dict) else None
+    return bounds if isinstance(bounds, list) and len(bounds) == 4 else None
+
+
 def point_is_inside_bounds(point: Any, bounds: Any) -> bool:
     if not (
         isinstance(point, (list, tuple))
@@ -786,6 +931,8 @@ def get_visual_page_map(
         content_sensitive=force_new,
     )
     descriptor = structure_descriptor(snapshot)
+    snapshot_foreground = detect_foreground_panel(snapshot)
+    snapshot_has_foreground = isinstance(snapshot_foreground, dict)
     provisional = visual_window_signature(window, page, "")
     maps = context.state.setdefault("visual_page_maps", {})
 
@@ -814,8 +961,14 @@ def get_visual_page_map(
         ]
     best: dict[str, Any] | None = None
     best_distance = 1.0
+    snapshot_has_foreground = detect_foreground_panel(snapshot) is not None
     if not force_new:
         for candidate in available:
+            candidate_has_foreground = mapped_foreground_bounds(candidate) is not None
+            if candidate_has_foreground != snapshot_has_foreground:
+                # A modal and its dimmed parent are separate interaction states,
+                # even when their coarse line descriptors remain very similar.
+                continue
             distance = descriptor_distance(descriptor, candidate.get("structureDescriptor"))
             if distance < best_distance:
                 best, best_distance = candidate, distance
@@ -872,6 +1025,7 @@ def get_visual_page_map(
     persisted_relationships = persisted.get("relationships", [])
     persisted_candidates = persisted.get("visualCandidates", [])
     persisted_unclassified = persisted.get("unclassified", [])
+    persisted_performance = persisted.get("performance", {})
     persisted_raw_ocr = persisted.get("rawOcr", [])
     persisted_descriptor = persisted.get("structureDescriptor", {})
     persisted_classification_version = int(persisted.get("classificationVersion") or 0)
@@ -907,6 +1061,7 @@ def get_visual_page_map(
         "relationships": persisted_relationships if isinstance(persisted_relationships, list) else [],
         "visualCandidates": persisted_candidates if isinstance(persisted_candidates, list) else [],
         "unclassified": persisted_unclassified if isinstance(persisted_unclassified, list) else [],
+        "performance": persisted_performance if isinstance(persisted_performance, dict) else {},
         "persistedRawOcr": persisted_raw_ocr if isinstance(persisted_raw_ocr, list) else [],
         "classificationVersion": persisted_classification_version,
     }
@@ -982,10 +1137,15 @@ def ensure_visual_ocr(
             offset_x = offset_y = 0
         ocr_image.save(screenshot_path)
         engine = context.state.get("ocr_engine")
+        engine_init_seconds = 0.0
         if engine is None:
+            engine_init_started = time.perf_counter()
             engine = marker.create_ocr_engine()
             context.state["ocr_engine"] = engine
+            engine_init_seconds = time.perf_counter() - engine_init_started
+        ocr_started = time.perf_counter()
         detected_items = marker.run_ocr(engine, screenshot_path)
+        ocr_seconds = time.perf_counter() - ocr_started
         items = [
             marker.OcrItem(
                 text=item.text,
@@ -1007,16 +1167,32 @@ def ensure_visual_ocr(
     page_map["ocrItems"] = items
     page_map["visualImage"] = visual_image
     page_map["pendingImage"] = None
+    regions_started = time.perf_counter()
     page_map["regions"] = build_ocr_regions(items)
+    regions_seconds = time.perf_counter() - regions_started
+    relationships_started = time.perf_counter()
     page_map["relationships"] = build_ocr_relationships(items)
+    relationships_seconds = time.perf_counter() - relationships_started
     classify_visual_page(page_map)
+    page_map.setdefault("performance", {}).update(
+        {
+            "engineInitSeconds": round(engine_init_seconds, 4),
+            "ocrSeconds": round(ocr_seconds, 4),
+            "regionBuildSeconds": round(regions_seconds, 4),
+            "relationshipBuildSeconds": round(relationships_seconds, 4),
+        }
+    )
     save_visual_targets(page_map)
+    performance = page_map.get("performance", {})
     context.emit(
         "info",
         (
             f"已建立新的视觉状态地图并完成预分类：{len(items)} 段文字，"
             f"{len(page_map.get('visualCandidates', []))} 个控件/表格候选；"
-            f"识别范围={'局部变化区域' if page_map.get('ocrBounds') else '完整窗口'}"
+            f"识别范围={'局部变化区域' if page_map.get('ocrBounds') else '完整窗口'}；"
+            f"耗时 OCR={performance.get('ocrSeconds', 0):.2f}s，"
+            f"候选检测与分类={performance.get('classificationSeconds', 0):.2f}s，"
+            f"关系={performance.get('relationshipBuildSeconds', 0):.2f}s"
         ),
         None,
     )
@@ -1044,6 +1220,68 @@ def visual_foreground_bounds(page_map: dict[str, Any]) -> list[int] | None:
         return None
     bounds = foreground.get("bounds")
     return bounds if isinstance(bounds, list) and len(bounds) == 4 else None
+
+
+def visual_table_bounds(page_map: dict[str, Any]) -> list[list[int]]:
+    """Return table bounds recorded by either the region or element inventory."""
+
+    tables: list[list[int]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for collection in (
+        page_map.get("regions") or [],
+        page_map.get("elements") or [],
+        page_map.get("visualCandidates") or [],
+    ):
+        for item in collection:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "")
+            if not (
+                item.get("type") == "table"
+                or item.get("kind") == "table"
+                or item_id.startswith("table-region-")
+            ):
+                continue
+            bounds = item.get("bounds")
+            if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+                continue
+            try:
+                normalized = tuple(int(value) for value in bounds)
+            except (TypeError, ValueError):
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            tables.append(list(normalized))
+    return tables
+
+
+def visual_bounds_overlap_table(
+    bounds: Any,
+    table_bounds: list[list[int]],
+) -> bool:
+    """Reject field candidates whose center or substantial area is inside a table."""
+
+    if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
+        return False
+    try:
+        left, top, right, bottom = (float(value) for value in bounds)
+    except (TypeError, ValueError):
+        return False
+    if right <= left or bottom <= top:
+        return False
+
+    center = [(left + right) / 2, (top + bottom) / 2]
+    area = (right - left) * (bottom - top)
+    for table in table_bounds:
+        if point_is_inside_bounds(center, table):
+            return True
+        table_left, table_top, table_right, table_bottom = table
+        overlap_width = max(0.0, min(right, table_right) - max(left, table_left))
+        overlap_height = max(0.0, min(bottom, table_bottom) - max(top, table_top))
+        if overlap_width * overlap_height / max(1.0, area) >= 0.25:
+            return True
+    return False
 
 
 def visual_toggle_anchor(
@@ -1152,6 +1390,7 @@ def visual_text_point(
     page: str = "current-page",
     role: str = "button",
     parent_page_map: dict[str, Any] | None = None,
+    force_new: bool = False,
 ) -> tuple[int, int] | None:
     """Resolve visible text from a reusable per-page visual element map."""
 
@@ -1161,6 +1400,7 @@ def visual_text_point(
         window,
         page,
         parent_page_map=parent_page_map,
+        force_new=force_new,
         prefer_changed_region=True,
         target_key=target_key,
     )
@@ -1228,18 +1468,43 @@ def visual_input_point(
     window: Any,
     field_name: str,
     page: str = "current-page",
+    force_new: bool = False,
 ) -> tuple[int, int] | None:
     """Infer a painted input area below its label and cache the relative point."""
 
-    page_map = get_visual_page_map(context, window, page)
     target_key = f"input:{field_name}"
+    page_map = get_visual_page_map(
+        context,
+        window,
+        page,
+        force_new=force_new,
+        prefer_changed_region=True,
+        target_key=target_key,
+    )
     foreground_bounds = visual_foreground_bounds(page_map)
+    table_bounds = visual_table_bounds(page_map)
     cached = page_map["targets"].get(target_key)
     if cached is not None:
         detail = page_map.get("targetDetails", {}).get(target_key, {})
+        cached_in_table = any(
+            point_is_inside_bounds(cached, table) for table in table_bounds
+        )
         if foreground_bounds is not None and not point_is_inside_bounds(
             cached, foreground_bounds
         ):
+            page_map["targets"].pop(target_key, None)
+            page_map.get("targetDetails", {}).pop(target_key, None)
+        elif cached_in_table or visual_bounds_overlap_table(
+            detail.get("bounds") if isinstance(detail, dict) else cached,
+            table_bounds,
+        ):
+            # A same-name table header may have been cached by the legacy
+            # on-demand locator. Never treat a table cell/header as an input.
+            context.emit(
+                "info",
+                f"已忽略字段“{field_name}”落在表格内的旧定位缓存，改用页面预分类输入框",
+                None,
+            )
             page_map["targets"].pop(target_key, None)
             page_map.get("targetDetails", {}).pop(target_key, None)
         elif not isinstance(detail, dict) or not detail.get("labelBounds"):
@@ -1256,7 +1521,75 @@ def visual_input_point(
 
     items = ensure_visual_ocr(context, window, page_map)
     target = marker.normalize_ocr_text(field_name)
-    labels = [item for item in items if item.text == target]
+    if not target:
+        return None
+
+    # Prefer the full-page classifier's field inventory. Unlike the legacy
+    # per-label scan, these candidates have already been separated from tables.
+    element_by_id = {
+        str(element.get("id")): element
+        for element in page_map.get("elements") or []
+        if isinstance(element, dict) and element.get("id")
+    }
+    classified_candidates: list[dict[str, Any]] = []
+    for element in page_map.get("elements") or []:
+        if not isinstance(element, dict) or element.get("kind") != "field-rectangle":
+            continue
+        if marker.normalize_ocr_text(element.get("labelText")) != target:
+            continue
+        bounds = element.get("bounds")
+        center = element.get("center")
+        if not isinstance(center, (list, tuple)) or len(center) != 2:
+            continue
+        label_element = element_by_id.get(str(element.get("labelId") or ""), {})
+        if str(label_element.get("kind") or "") in {
+            "table-header",
+            "table-cell-text",
+            "background-text",
+        }:
+            continue
+        if visual_bounds_overlap_table(bounds, table_bounds):
+            continue
+        if foreground_bounds is not None and not point_is_inside_bounds(
+            center, foreground_bounds
+        ):
+            continue
+        classified_candidates.append(element)
+
+    if classified_candidates:
+        candidate = max(
+            classified_candidates,
+            key=lambda item: float(item.get("score") or 0),
+        )
+        local_point = [int(value) for value in candidate["center"]]
+        label_element = element_by_id.get(str(candidate.get("labelId") or ""), {})
+        label_bounds = label_element.get("bounds")
+        page_map["targets"][target_key] = local_point
+        page_map["targetDetails"][target_key] = {
+            "role": "input",
+            "name": field_name,
+            "bounds": candidate.get("bounds"),
+            "clickPoint": local_point,
+            "labelBounds": label_bounds,
+            "relation": candidate.get("relation"),
+            "confidence": candidate.get("score"),
+            "source": "ocr-page-classifier",
+        }
+        save_visual_targets(page_map)
+        return local_point_to_screen(window, local_point)
+
+    labels = [
+        item
+        for item in items
+        if item.text == target
+        and not any(
+            point_is_inside_bounds(
+                [(item.left + item.right) // 2, (item.top + item.bottom) // 2],
+                table,
+            )
+            for table in table_bounds
+        )
+    ]
     if foreground_bounds is not None:
         labels = [
             item
@@ -1275,7 +1608,9 @@ def visual_input_point(
     detected: list[tuple[Any, dict[str, Any]]] = []
     for label in labels:
         rectangle = find_input_rectangle(visual_image, label)
-        if rectangle is not None:
+        if rectangle is not None and not visual_bounds_overlap_table(
+            rectangle.get("bounds"), table_bounds
+        ):
             detected.append((label, rectangle))
     if not detected:
         return None
@@ -1309,11 +1644,19 @@ def visual_select_point(
     window: Any,
     field_name: str,
     page: str = "current-page",
+    force_new: bool = False,
 ) -> tuple[int, int] | None:
     """Locate a visually rendered select/combo box by its label."""
 
-    page_map = get_visual_page_map(context, window, page)
     target_key = f"select:{field_name}"
+    page_map = get_visual_page_map(
+        context,
+        window,
+        page,
+        force_new=force_new,
+        prefer_changed_region=True,
+        target_key=target_key,
+    )
     foreground_bounds = visual_foreground_bounds(page_map)
     cached = page_map["targets"].get(target_key)
     if cached is not None:
@@ -1378,11 +1721,19 @@ def visual_checkbox_point(
     window: Any,
     checkbox_name: str,
     page: str = "current-page",
+    force_new: bool = False,
 ) -> tuple[int, int] | None:
     """Locate a painted checkbox around its label without assuming direction."""
 
-    page_map = get_visual_page_map(context, window, page)
     target_key = f"checkbox:{checkbox_name}"
+    page_map = get_visual_page_map(
+        context,
+        window,
+        page,
+        force_new=force_new,
+        prefer_changed_region=True,
+        target_key=target_key,
+    )
     foreground_bounds = visual_foreground_bounds(page_map)
     cached = page_map["targets"].get(target_key)
     if cached is not None:
@@ -1477,17 +1828,36 @@ def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> di
         raise WorkflowExecutionError(f"字段“{field_name}”的填写内容不能为空")
 
     window = current_window(context)
+    page = visual_page_id(params)
     point = visual_input_point(
         context,
         window,
         field_name,
-        page=visual_page_id(params),
+        page=page,
     )
+    if point is None:
+        context.emit(
+            "info",
+            f"视觉地图未找到字段“{field_name}”，刷新当前页面后再次视觉识别",
+            None,
+        )
+        point = visual_input_point(
+            context,
+            window,
+            field_name,
+            page=page,
+            force_new=True,
+        )
     if point is not None:
         mouse.click(button="left", coords=point)
         locator_mode = "visual-map"
     else:
-        control = find_his_edit_control(window, field_name, timeout)
+        control = find_his_edit_control(
+            window,
+            field_name,
+            timeout,
+            required_screen_bounds=active_foreground_screen_bounds(window),
+        )
         if control is None:
             raise WorkflowExecutionError(
                 f"视觉页面布局中未找到字段“{field_name}”，UIA 也无法识别该字段"
@@ -1538,8 +1908,27 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
 
     window = current_window(context)
     page = visual_page_id(params)
-    source_map = get_visual_page_map(context, window, page)
+    source_map = get_visual_page_map(
+        context,
+        window,
+        page,
+        prefer_changed_region=True,
+        target_key=f"select:{field_name}",
+    )
     point = visual_select_point(context, window, field_name, page=page)
+    if point is None:
+        context.emit(
+            "info",
+            f"视觉地图未找到下拉框“{field_name}”，刷新当前页面后再次视觉识别",
+            None,
+        )
+        point = visual_select_point(
+            context,
+            window,
+            field_name,
+            page=page,
+            force_new=True,
+        )
     if point is not None:
         mouse.click(button="left", coords=point)
         context.wait(0.25)
@@ -1562,7 +1951,13 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
             send_keys("{ENTER}", pause=0.06)
             locator_mode = "visual-map-keyboard"
     else:
-        control = find_named_his_control(window, field_name, {"ComboBox"}, timeout)
+        control = find_named_his_control(
+            window,
+            field_name,
+            {"ComboBox"},
+            timeout,
+            required_screen_bounds=active_foreground_screen_bounds(window),
+        )
         if control is None:
             raise WorkflowExecutionError(
                 f"视觉页面布局中未找到下拉框“{field_name}”，UIA 也无法识别该控件"
@@ -1601,12 +1996,26 @@ def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> d
         raise WorkflowExecutionError("勾选框目标状态无效")
 
     window = current_window(context)
+    page = visual_page_id(params)
     point = visual_checkbox_point(
         context,
         window,
         checkbox_name,
-        page=visual_page_id(params),
+        page=page,
     )
+    if point is None:
+        context.emit(
+            "info",
+            f"视觉地图未找到勾选框“{checkbox_name}”，刷新当前页面后再次视觉识别",
+            None,
+        )
+        point = visual_checkbox_point(
+            context,
+            window,
+            checkbox_name,
+            page=page,
+            force_new=True,
+        )
     if point is not None:
         locator_mode = "visual-map"
         current_state = visual_checkbox_state(point)
@@ -1618,7 +2027,13 @@ def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> d
         if should_click:
             mouse.click(button="left", coords=point)
     else:
-        control = find_named_his_control(window, checkbox_name, {"CheckBox"}, timeout)
+        control = find_named_his_control(
+            window,
+            checkbox_name,
+            {"CheckBox"},
+            timeout,
+            required_screen_bounds=active_foreground_screen_bounds(window),
+        )
         if control is None:
             raise WorkflowExecutionError(
                 f"视觉页面布局中未找到勾选框“{checkbox_name}”，UIA 也无法识别该控件"
@@ -1685,6 +2100,20 @@ def run_his_click_object(context: ExecutionContext, params: dict[str, Any]) -> d
         contains=match_mode == "包含文字",
         page=page,
     )
+    if point is None:
+        context.emit(
+            "info",
+            f"视觉地图未找到对象“{target_name}”，刷新当前页面后再次视觉识别",
+            None,
+        )
+        point = visual_text_point(
+            context,
+            window,
+            target_name,
+            contains=match_mode == "包含文字",
+            page=page,
+            force_new=True,
+        )
     if point is not None:
         mouse.click(button="left", coords=point)
         locator_mode = "visual-map"
@@ -1710,6 +2139,7 @@ def run_his_click_object(context: ExecutionContext, params: dict[str, Any]) -> d
             control_types,
             timeout,
             contains=match_mode == "包含文字",
+            required_screen_bounds=active_foreground_screen_bounds(window),
         )
         if control is None:
             raise WorkflowExecutionError(
@@ -1742,17 +2172,36 @@ def run_his_input_number(context: ExecutionContext, params: dict[str, Any]) -> d
     marker.base.HOSPITALIZATION_NUMBER = number
     context.variables["hospitalization_number"] = number
     window = current_window(context)
+    page = visual_page_id(params)
     point = visual_input_point(
         context,
         window,
         "住院号",
-        page=visual_page_id(params),
+        page=page,
     )
+    if point is None:
+        context.emit(
+            "info",
+            "视觉地图未找到住院号输入框，刷新当前页面后再次视觉识别",
+            None,
+        )
+        point = visual_input_point(
+            context,
+            window,
+            "住院号",
+            page=page,
+            force_new=True,
+        )
     if point is not None:
         mouse.click(button="left", coords=point)
         locator_mode = "visual-map"
     else:
-        control = find_his_edit_control(window, "住院号", 5.0)
+        control = find_his_edit_control(
+            window,
+            "住院号",
+            5.0,
+            required_screen_bounds=active_foreground_screen_bounds(window),
+        )
         if control is None:
             raise WorkflowExecutionError(
                 "视觉页面布局中未找到住院号输入框，UIA 也无法识别该字段"
@@ -2944,6 +3393,19 @@ def run_his_input_date(context: ExecutionContext, params: dict[str, Any]) -> dic
     window = current_window(context)
     page = visual_page_id(params)
     point = visual_input_point(context, window, field_name, page=page)
+    if point is None:
+        context.emit(
+            "info",
+            f"视觉地图未找到日期字段“{field_name}”，刷新当前页面后再次视觉识别",
+            None,
+        )
+        point = visual_input_point(
+            context,
+            window,
+            field_name,
+            page=page,
+            force_new=True,
+        )
     if point is None:
         raise WorkflowExecutionError(
             f"视觉页面布局中未找到日期字段“{field_name}”"

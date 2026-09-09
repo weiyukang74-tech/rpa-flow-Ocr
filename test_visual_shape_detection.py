@@ -11,9 +11,12 @@ from visual_shape_detection import (
     checkbox_bounds_match_label,
     detect_foreground_panel,
     detect_table_regions,
+    detect_visual_control_candidates,
     find_checkbox_square,
     find_input_rectangle,
     input_bounds_match_label,
+    match_checkbox_candidate,
+    match_input_candidate,
 )
 
 
@@ -150,6 +153,44 @@ class VisualShapeDetectionTests(unittest.TestCase):
         self.assertLessEqual(top, 122)
         self.assertGreaterEqual(right, 469)
         self.assertGreaterEqual(bottom, 249)
+
+    def test_detects_control_candidates_once_and_associates_labels(self) -> None:
+        image = Image.new("RGB", (460, 190), (238, 242, 246))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle(
+            (130, 38, 350, 76),
+            fill="white",
+            outline=(130, 165, 195),
+            width=2,
+        )
+        draw.rectangle((327, 49, 339, 62), outline=(30, 55, 70), width=2)
+        draw.rectangle((42, 113, 62, 133), fill="white", outline=(65, 95, 120), width=2)
+
+        inventory = detect_visual_control_candidates(image)
+        field_label = SimpleNamespace(left=48, top=46, right=118, bottom=68)
+        checkbox_label = SimpleNamespace(
+            left=70,
+            top=113,
+            right=180,
+            bottom=134,
+            raw_text="出院患者",
+        )
+        field = match_input_candidate(inventory["fieldRectangles"], field_label)
+        checkbox = match_checkbox_candidate(inventory["squareControls"], checkbox_label)
+
+        self.assertIsNotNone(field)
+        self.assertIsNotNone(checkbox)
+        assert field is not None and checkbox is not None
+        self.assertEqual(field["relation"], "right")
+        self.assertLessEqual(abs(field["center"][0] - 240), 3)
+        self.assertEqual(checkbox["relation"], "left")
+        self.assertLessEqual(abs(checkbox["center"][0] - 52), 3)
+        self.assertTrue(
+            all(
+                not (130 <= candidate["center"][0] <= 350 and 38 <= candidate["center"][1] <= 76)
+                for candidate in inventory["squareControls"]
+            )
+        )
 
     def test_detects_bright_dialog_over_dimmed_background(self) -> None:
         image = Image.new("RGB", (1000, 600), (174, 180, 184))

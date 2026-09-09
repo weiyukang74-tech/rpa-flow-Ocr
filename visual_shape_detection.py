@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -22,6 +23,183 @@ def _true_runs(values: np.ndarray) -> list[tuple[int, int]]:
     starts = np.flatnonzero(transitions == 1)
     ends = np.flatnonzero(transitions == -1)
     return [(int(start), int(end)) for start, end in zip(starts, ends)]
+
+
+def _border_coverage(edges: np.ndarray, bounds: list[int]) -> tuple[float, float]:
+    """Return minimum and average edge coverage around a rectangle border."""
+
+    left, top, right, bottom = bounds
+    height, width = edges.shape
+    left = max(0, min(width - 1, left))
+    right = max(left + 1, min(width - 1, right))
+    top = max(0, min(height - 1, top))
+    bottom = max(top + 1, min(height - 1, bottom))
+    band = 2
+    sides = (
+        edges[max(0, top - band) : min(height, top + band + 1), left : right + 1],
+        edges[max(0, bottom - band) : min(height, bottom + band + 1), left : right + 1],
+        edges[top : bottom + 1, max(0, left - band) : min(width, left + band + 1)],
+        edges[top : bottom + 1, max(0, right - band) : min(width, right + band + 1)],
+    )
+    coverages = [float(np.count_nonzero(side)) / max(1, side.size) for side in sides]
+    return min(coverages), sum(coverages) / len(coverages)
+
+
+def _intersection_over_union(first: list[int], second: list[int]) -> float:
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[2], second[2])
+    bottom = min(first[3], second[3])
+    intersection = max(0, right - left) * max(0, bottom - top)
+    first_area = max(1, first[2] - first[0]) * max(1, first[3] - first[1])
+    second_area = max(1, second[2] - second[0]) * max(1, second[3] - second[1])
+    return intersection / max(1, first_area + second_area - intersection)
+
+
+def _deduplicate_rectangles(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse the inner and outer contours produced by one painted border."""
+
+    selected: list[dict[str, Any]] = []
+    for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
+        bounds = candidate["bounds"]
+        center_x, center_y = candidate["center"]
+        duplicate = False
+        for existing in selected:
+            existing_x, existing_y = existing["center"]
+            existing_bounds = existing["bounds"]
+            if (
+                _intersection_over_union(bounds, existing_bounds) >= 0.72
+                or (
+                    abs(center_x - existing_x) <= 3
+                    and abs(center_y - existing_y) <= 3
+                    and abs((bounds[2] - bounds[0]) - (existing_bounds[2] - existing_bounds[0])) <= 6
+                    and abs((bounds[3] - bounds[1]) - (existing_bounds[3] - existing_bounds[1])) <= 6
+                )
+            ):
+                duplicate = True
+                break
+        if not duplicate:
+            selected.append(candidate)
+    return sorted(selected, key=lambda item: (item["bounds"][1], item["bounds"][0]))
+
+
+def detect_visual_control_candidates(image: Image.Image) -> dict[str, list[dict[str, Any]]]:
+    """Extract field-like rectangles and small square controls in one pass.
+
+    Contours are calculated once for the entire screenshot. Later classification
+    only associates these reusable candidates with OCR labels, avoiding a fresh
+    neighborhood scan for every text fragment.
+    """
+
+    rgb = np.asarray(image.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 22, 72)
+    closed = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+    )
+    contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    fields: list[dict[str, Any]] = []
+    squares: list[dict[str, Any]] = []
+    image_area = max(1, image.width * image.height)
+
+    for contour in contours:
+        x, y, width, height = cv2.boundingRect(contour)
+        if width < 8 or height < 8 or width * height > image_area * 0.30:
+            continue
+        right, bottom = x + width - 1, y + height - 1
+        bounds = [int(x), int(y), int(right), int(bottom)]
+        minimum_border, average_border = _border_coverage(edges, bounds)
+        contour_area = float(abs(cv2.contourArea(contour)))
+        rectangularity = contour_area / max(1.0, float(width * height))
+        perimeter = cv2.arcLength(contour, True)
+        polygon = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
+        center = [int(x + width // 2), int(y + height // 2)]
+
+        if (
+            45 <= width <= min(900, round(image.width * 0.75))
+            and 18 <= height <= 120
+            and width / max(1, height) >= 1.45
+            and minimum_border >= 0.10
+            and average_border >= 0.20
+            and rectangularity >= 0.42
+            and 4 <= len(polygon) <= 12
+        ):
+            inset = max(2, min(6, height // 5))
+            interior = rgb[
+                min(image.height, y + inset) : max(
+                    y + inset + 1,
+                    min(image.height, y + height - inset),
+                ),
+                min(image.width, x + inset) : max(
+                    x + inset + 1,
+                    min(image.width, x + width - inset),
+                ),
+            ]
+            interior_luminance = float(interior.mean()) if interior.size else 0.0
+            if interior_luminance >= 175:
+                score = (
+                    average_border * 75
+                    + minimum_border * 35
+                    + min(1.0, rectangularity) * 20
+                    + max(0.0, 1.0 - abs(height - 34) / 80) * 10
+                )
+                fields.append(
+                    {
+                        "bounds": bounds,
+                        "center": center,
+                        "score": round(score, 3),
+                        "source": "global-contour",
+                    }
+                )
+
+        aspect = width / max(1, height)
+        if (
+            8 <= width <= 48
+            and 8 <= height <= 48
+            and 0.65 <= aspect <= 1.45
+            and minimum_border >= 0.10
+            and average_border >= 0.20
+            and rectangularity >= 0.25
+            and 4 <= len(polygon) <= 16
+        ):
+            score = (
+                average_border * 80
+                + minimum_border * 40
+                + min(1.0, rectangularity) * 20
+                + max(0.0, 1.0 - abs(width - height) / max(width, height)) * 15
+            )
+            squares.append(
+                {
+                    "bounds": bounds,
+                    "center": center,
+                    "score": round(score, 3),
+                    "source": "global-contour",
+                }
+            )
+
+    fields = _deduplicate_rectangles(fields)
+    squares = _deduplicate_rectangles(squares)
+
+    # Calendar icons and combo arrows live inside a field rectangle. They are
+    # not independent checkboxes, so enforce mutual exclusion before labels are
+    # associated with the candidate pool.
+    independent_squares = []
+    for square in squares:
+        center_x, center_y = square["center"]
+        if any(
+            field["bounds"][0] - 2 <= center_x <= field["bounds"][2] + 2
+            and field["bounds"][1] - 2 <= center_y <= field["bounds"][3] + 2
+            for field in fields
+        ):
+            continue
+        independent_squares.append(square)
+
+    return {
+        "fieldRectangles": fields,
+        "squareControls": independent_squares,
+    }
 
 
 def detect_foreground_panel(image: Image.Image) -> dict[str, Any] | None:
@@ -391,6 +569,54 @@ def find_input_rectangle(image: Image.Image, label: Any) -> dict[str, Any] | Non
     return max(vertical, key=lambda item: item["score"]) if vertical else None
 
 
+def match_input_candidate(
+    candidates: list[dict[str, Any]],
+    label: Any,
+) -> dict[str, Any] | None:
+    """Associate one OCR label with the best already-detected field rectangle."""
+
+    label_bounds = [label.left, label.top, label.right, label.bottom]
+    label_center_x = (label.left + label.right) / 2
+    label_center_y = (label.top + label.bottom) / 2
+    matches: list[dict[str, Any]] = []
+    for candidate in candidates:
+        left, top, right, bottom = candidate["bounds"]
+        center_x, center_y = candidate["center"]
+        relations: list[str] = []
+        if left >= label.right - 2:
+            relations.append("right")
+        if right <= label.left + 2:
+            relations.append("left")
+        if top >= label.bottom - 2:
+            relations.append("below")
+        if bottom <= label.top + 2:
+            relations.append("above")
+        for relation in relations:
+            if not input_bounds_match_label(candidate["bounds"], label_bounds, relation):
+                continue
+            distance = (
+                (center_x - label_center_x) ** 2
+                + (center_y - label_center_y) ** 2
+            ) ** 0.5
+            height = bottom - top + 1
+            relation_bonus = 18.0 if relation in {"left", "right"} else 0.0
+            score = (
+                float(candidate.get("score") or 0.0)
+                + relation_bonus
+                - distance * 0.08
+                - abs(height - 34) * 0.35
+            )
+            matches.append(
+                {**candidate, "relation": relation, "score": round(score, 3)}
+            )
+    if not matches:
+        return None
+    horizontal = [
+        item for item in matches if item["relation"] in {"left", "right"}
+    ]
+    return max(horizontal or matches, key=lambda item: item["score"])
+
+
 def square_outline_score(
     image: Image.Image,
     center_x: int,
@@ -606,3 +832,81 @@ def find_checkbox_square(image: Image.Image, label: Any) -> dict[str, Any] | Non
         if best["score"] >= 42:
             return best
     return None
+
+
+def match_checkbox_candidate(
+    candidates: list[dict[str, Any]],
+    label: Any,
+) -> dict[str, Any] | None:
+    """Associate one OCR label with a precomputed square-control candidate."""
+
+    label_center_x = (label.left + label.right) / 2
+    label_center_y = (label.top + label.bottom) / 2
+    label_height = max(8, label.bottom - label.top)
+    raw_text = "".join(str(getattr(label, "raw_text", "") or "").split())
+    checkbox_prefixes = ("✅", "☑", "☒", "☐", "□", "▣", "■", "✔", "✓")
+    if raw_text.startswith(checkbox_prefixes):
+        size = min(32, max(12, round(label_height * 0.78)))
+        center_x = label.left + max(6, size // 2)
+        center_y = round(label_center_y)
+        half = size // 2
+        return {
+            "bounds": [
+                center_x - half,
+                center_y - half,
+                center_x + half,
+                center_y + half,
+            ],
+            "center": [center_x, center_y],
+            "relation": "ocr-prefix",
+            "score": 150.0,
+            "source": "ocr-prefix",
+        }
+
+    label_bounds = [label.left, label.top, label.right, label.bottom]
+    matches: list[dict[str, Any]] = []
+    for candidate in candidates:
+        left, top, right, bottom = candidate["bounds"]
+        center_x, center_y = candidate["center"]
+        relations: list[str] = []
+        if right <= label.left + 2:
+            relations.append("left")
+        if left >= label.right - 2:
+            relations.append("right")
+        if bottom <= label.top + 2:
+            relations.append("above")
+        if top >= label.bottom - 2:
+            relations.append("below")
+        for relation in relations:
+            if not checkbox_bounds_match_label(
+                candidate["bounds"], label_bounds, relation
+            ):
+                continue
+            if relation in {"left", "right"}:
+                alignment_penalty = abs(center_y - label_center_y) * 1.5
+                gap = label.left - right if relation == "left" else left - label.right
+                relation_bonus = 15.0
+            else:
+                alignment_penalty = abs(center_x - label_center_x) * 1.5
+                gap = label.top - bottom if relation == "above" else top - label.bottom
+                relation_bonus = 0.0
+            score = (
+                float(candidate.get("score") or 0.0)
+                + relation_bonus
+                - alignment_penalty
+                - max(0.0, gap) * 0.35
+            )
+            matches.append(
+                {
+                    **candidate,
+                    "relation": relation,
+                    "score": round(score, 3),
+                    "gap": round(max(0.0, gap), 3),
+                }
+            )
+    if not matches:
+        return None
+    horizontal = [
+        item for item in matches if item["relation"] in {"left", "right"}
+    ]
+    return max(horizontal or matches, key=lambda item: item["score"])
