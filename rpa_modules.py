@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import datetime
 import hashlib
 import json
 import time
@@ -15,7 +16,21 @@ STUDIO_ROOT = Path(__file__).resolve().parent
 
 import his_automation as his
 import ocr_marker as marker
-from visual_shape_detection import find_checkbox_square, find_input_rectangle
+from visual_shape_detection import (
+    checkbox_bounds_match_label,
+    detect_foreground_panel,
+    detect_table_regions,
+    find_checkbox_square,
+    find_input_rectangle,
+    input_bounds_match_label,
+)
+from visual_state import (
+    changed_region,
+    descriptor_distance,
+    is_interactive_overlay_change,
+    is_local_change,
+    structure_descriptor,
+)
 from pywinauto import mouse
 from pywinauto.keyboard import send_keys
 
@@ -180,15 +195,20 @@ def visual_page_id(params: dict[str, Any]) -> str:
     return page[:80]
 
 
-def visual_window_signature(window: Any, page: str) -> dict[str, Any]:
+def visual_window_signature(
+    window: Any,
+    page: str,
+    state_fingerprint: str,
+) -> dict[str, Any]:
     rect = window.rectangle()
     width = int(rect.right - rect.left)
     height = int(rect.bottom - rect.top)
     if width <= 0 or height <= 0:
         raise WorkflowExecutionError("目标窗口没有有效的屏幕区域")
     return {
-        "locatorVersion": 4,
+        "locatorVersion": 6,
         "page": page,
+        "stateFingerprint": state_fingerprint,
         "windowTitle": his.normalize_text(window.window_text()),
         "className": str(getattr(window.element_info, "class_name", "") or ""),
         "width": width,
@@ -246,12 +266,16 @@ def save_visual_targets(page_map: dict[str, Any]) -> None:
         for index, item in enumerate(page_map.get("ocrItems") or [])
     ]
     payload = {
-        "schemaVersion": 4,
+        "schemaVersion": 6,
+        "classificationVersion": page_map.get("classificationVersion", 0),
         "signature": page_map["signature"],
         "targets": page_map["targets"],
         "targetDetails": page_map.get("targetDetails", {}),
         "elements": page_map.get("elements", []),
         "ambiguousTargets": page_map.get("ambiguousTargets", {}),
+        "structureDescriptor": page_map.get("structureDescriptor", {}),
+        "parentSignature": page_map.get("parentSignature"),
+        "changeRegion": page_map.get("changeRegion"),
         "rawOcr": raw_ocr,
         "regions": page_map.get("regions", []),
         "relationships": page_map.get("relationships", []),
@@ -343,15 +367,12 @@ def build_ocr_relationships(items: list[Any]) -> list[dict[str, Any]]:
     return relationships
 
 
-def classify_visual_page(page_map: dict[str, Any]) -> None:
-    """Classify the complete OCR page once and persist reusable control targets.
+VISUAL_CLASSIFICATION_VERSION = 2
+VISUAL_CHECKBOX_LOCATOR_VERSION = 3
 
-    Classification stays application-neutral. A painted rectangle linked to a
-    label is recorded as a field candidate that may be used by either an input
-    or select action; the workflow action supplies the final semantic intent.
-    Every OCR occurrence is retained, including duplicate labels that cannot be
-    safely collapsed into one click target.
-    """
+
+def classify_visual_page(page_map: dict[str, Any]) -> None:
+    """Preclassify a new OCR page once and persist reusable semantic controls."""
 
     items = page_map.get("ocrItems")
     image = page_map.get("visualImage")
@@ -361,16 +382,73 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
     elements: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
     occurrences: dict[str, list[int]] = {}
+    actionable_occurrences: dict[str, list[int]] = {}
     resolved_text_ids: set[str] = set()
+    foreground = None if page_map.get("ocrBounds") else detect_foreground_panel(image)
+    foreground_bounds = foreground.get("bounds") if foreground else None
+    table_regions = [] if page_map.get("ocrBounds") else detect_table_regions(image)
+    if foreground_bounds is not None:
+        table_regions = [
+            table
+            for table in table_regions
+            if point_is_inside_bounds(
+                [
+                    (table["bounds"][0] + table["bounds"][2]) // 2,
+                    (table["bounds"][1] + table["bounds"][3]) // 2,
+                ],
+                foreground_bounds,
+            )
+        ]
+
+    def is_in_foreground(item: Any) -> bool:
+        return point_is_inside_bounds(
+            [(item.left + item.right) // 2, (item.top + item.bottom) // 2],
+            foreground_bounds,
+        )
+
+    def table_for_item(item: Any) -> tuple[int, dict[str, Any]] | None:
+        center_x = (item.left + item.right) // 2
+        center_y = (item.top + item.bottom) // 2
+        for table_index, table in enumerate(table_regions):
+            left, top, right, bottom = table["bounds"]
+            if left <= center_x <= right and top <= center_y <= bottom:
+                return table_index, table
+        return None
+
+    table_first_rows: dict[int, int] = {}
+    for index, table in enumerate(table_regions):
+        centers = [
+            (item.top + item.bottom) // 2
+            for item in items
+            if table_for_item(item) is not None and table_for_item(item)[0] == index
+        ]
+        if centers:
+            table_first_rows[index] = min(centers)
 
     for index, item in enumerate(items):
         element_id = f"text-{index:04d}"
         normalized = marker.normalize_ocr_text(item.text)
         occurrences.setdefault(normalized, []).append(index)
+        table_match = table_for_item(item)
+        if foreground_bounds is not None and not is_in_foreground(item):
+            kind = "background-text"
+            possible_roles = ["background-text"]
+            resolved_text_ids.add(element_id)
+        elif table_match is None:
+            kind = "text"
+            possible_roles = ["text", "button", "tab", "menu-item", "link"]
+            actionable_occurrences.setdefault(normalized, []).append(index)
+        else:
+            table_index, _ = table_match
+            center_y = (item.top + item.bottom) // 2
+            first_y = table_first_rows.get(table_index, center_y)
+            kind = "table-header" if center_y <= first_y + 12 else "table-cell-text"
+            possible_roles = [kind]
+            resolved_text_ids.add(element_id)
         elements.append(
             {
                 "id": element_id,
-                "kind": "text",
+                "kind": kind,
                 "text": item.text,
                 "rawText": item.raw_text,
                 "bounds": [item.left, item.top, item.right, item.bottom],
@@ -379,7 +457,7 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
                     (item.top + item.bottom) // 2,
                 ],
                 "confidence": round(float(item.score), 5),
-                "possibleRoles": ["text", "button", "tab", "menu-item", "link"],
+                "possibleRoles": possible_roles,
             }
         )
 
@@ -390,8 +468,18 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
         ids = [f"text-{index:04d}" for index in indexes]
         if len(indexes) > 1:
             ambiguous[normalized] = ids
+        actionable_indexes = actionable_occurrences.get(normalized, [])
+        foreground_indexes = [
+            index for index in actionable_indexes if is_in_foreground(items[index])
+        ]
+        if foreground_bounds is not None:
+            if len(foreground_indexes) != 1:
+                continue
+            index = foreground_indexes[0]
+        elif len(actionable_indexes) == 1:
+            index = actionable_indexes[0]
+        else:
             continue
-        index = indexes[0]
         item = items[index]
         point = [(item.left + item.right) // 2, (item.top + item.bottom) // 2]
         key = f"button:exact:{item.text}"
@@ -410,26 +498,36 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
             },
         )
 
+    # Remove stale auto-detected controls before rebuilding the complete page.
+    for key in list(page_map.get("targets", {})):
+        if key.startswith(("input:", "select:", "checkbox:")):
+            page_map["targets"].pop(key, None)
+            page_map.get("targetDetails", {}).pop(key, None)
+
     for index, label in enumerate(items):
+        if (
+            table_for_item(label) is not None
+            or (foreground_bounds is not None and not is_in_foreground(label))
+        ):
+            continue
         normalized = marker.normalize_ocr_text(label.text)
         if not normalized:
             continue
         label_id = f"text-{index:04d}"
-        unique_label = len(occurrences.get(normalized, [])) == 1
+        unique_label = len(actionable_occurrences.get(normalized, [])) == 1
 
         rectangle = find_input_rectangle(image, label)
-        if rectangle is not None:
-            candidate_id = f"field-{len(candidates):04d}"
+        if rectangle is not None and not any(
+            point_is_inside_bounds(rectangle["center"], table["bounds"])
+            for table in table_regions
+        ):
             candidate = {
-                "id": candidate_id,
+                "id": f"field-{len(candidates):04d}",
                 "kind": "field-rectangle",
                 "possibleRoles": ["input", "select"],
                 "labelText": label.text,
                 "labelId": label_id,
-                "bounds": rectangle["bounds"],
-                "center": rectangle["center"],
-                "relation": rectangle["relation"],
-                "score": rectangle["score"],
+                **rectangle,
             }
             candidates.append(candidate)
             elements.append(candidate)
@@ -437,67 +535,73 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
             if unique_label:
                 for role in ("input", "select"):
                     key = f"{role}:{label.text}"
-                    page_map["targets"].setdefault(key, list(rectangle["center"]))
-                    page_map["targetDetails"].setdefault(
-                        key,
-                        {
-                            "role": "field",
-                            "possibleRoles": ["input", "select"],
-                            "name": label.text,
-                            "bounds": rectangle["bounds"],
-                            "clickPoint": rectangle["center"],
-                            "labelBounds": [
-                                label.left,
-                                label.top,
-                                label.right,
-                                label.bottom,
-                            ],
-                            "relation": rectangle["relation"],
-                            "confidence": rectangle["score"],
-                            "source": "ocr-page-classifier",
-                        },
-                    )
+                    page_map["targets"][key] = list(rectangle["center"])
+                    page_map["targetDetails"][key] = {
+                        "role": "field",
+                        "possibleRoles": ["input", "select"],
+                        "name": label.text,
+                        "bounds": rectangle["bounds"],
+                        "clickPoint": rectangle["center"],
+                        "labelBounds": [label.left, label.top, label.right, label.bottom],
+                        "relation": rectangle["relation"],
+                        "confidence": rectangle["score"],
+                        "source": "ocr-page-classifier",
+                    }
 
         square = find_checkbox_square(image, label)
-        if square is not None:
-            candidate_id = f"checkbox-{len(candidates):04d}"
+        if square is not None and not any(
+            point_is_inside_bounds(square["center"], table["bounds"])
+            for table in table_regions
+        ):
             candidate = {
-                "id": candidate_id,
+                "id": f"checkbox-{len(candidates):04d}",
                 "kind": "checkbox",
                 "possibleRoles": ["checkbox", "toggle"],
                 "labelText": label.text,
                 "labelId": label_id,
-                "bounds": square["bounds"],
-                "center": square["center"],
-                "relation": square["relation"],
-                "score": square["score"],
+                **square,
             }
             candidates.append(candidate)
             elements.append(candidate)
             resolved_text_ids.add(label_id)
             if unique_label:
                 key = f"checkbox:{label.text}"
-                page_map["targets"].setdefault(key, list(square["center"]))
-                page_map["targetDetails"].setdefault(
-                    key,
-                    {
-                        "role": "checkbox",
-                        "possibleRoles": ["checkbox", "toggle"],
-                        "name": label.text,
-                        "bounds": square["bounds"],
-                        "clickPoint": square["center"],
-                        "labelBounds": [
-                            label.left,
-                            label.top,
-                            label.right,
-                            label.bottom,
-                        ],
-                        "relation": square["relation"],
-                        "confidence": square["score"],
-                        "source": "ocr-page-classifier",
-                    },
-                )
+                page_map["targets"][key] = list(square["center"])
+                page_map["targetDetails"][key] = {
+                    "role": "checkbox",
+                    "possibleRoles": ["checkbox", "toggle"],
+                    "name": label.text,
+                    "bounds": square["bounds"],
+                    "clickPoint": square["center"],
+                    "labelBounds": [label.left, label.top, label.right, label.bottom],
+                    "relation": square["relation"],
+                    "confidence": square["score"],
+                    "source": "ocr-page-classifier",
+                    "locatorVersion": VISUAL_CHECKBOX_LOCATOR_VERSION,
+                }
 
+    for table_index, table in enumerate(table_regions):
+        table_element = {"id": f"table-{table_index:03d}", **table}
+        elements.append(table_element)
+        candidates.append(table_element)
+
+    base_regions = [
+        region
+        for region in page_map.get("regions", [])
+        if region.get("type") not in {"table", "foreground-dialog"}
+    ]
+    if foreground is not None:
+        base_regions.append(
+            {
+                "id": "foreground-dialog-000",
+                "type": "foreground-dialog",
+                **foreground,
+            }
+        )
+    page_map["regions"] = base_regions + [
+        {"id": f"table-region-{index:03d}", "type": "table", **table}
+        for index, table in enumerate(table_regions)
+    ]
     page_map["elements"] = elements
     page_map["ambiguousTargets"] = ambiguous
     page_map["visualCandidates"] = candidates
@@ -506,20 +610,261 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
         for index in range(len(items))
         if f"text-{index:04d}" not in resolved_text_ids
     ]
+    page_map["classificationVersion"] = VISUAL_CLASSIFICATION_VERSION
+
+
+def capture_visual_window(window: Any) -> Image.Image:
+    rect = window.rectangle()
+    with ImageGrab.grab(
+        bbox=(rect.left, rect.top, rect.right, rect.bottom)
+    ) as screenshot:
+        return screenshot.convert("RGB")
+
+
+def capture_stable_visual_window(
+    context: ExecutionContext,
+    window: Any,
+    timeout: float = 2.0,
+    minimum_wait: float = 0.0,
+    stable_samples: int = 1,
+    content_sensitive: bool = False,
+) -> Image.Image:
+    """Wait briefly for rendering to settle before choosing a page state."""
+
+    started = time.monotonic()
+    previous = capture_visual_window(window)
+    previous_descriptor = structure_descriptor(previous)
+    deadline = time.monotonic() + max(0.2, timeout)
+    stable_count = 0
+    while time.monotonic() < deadline:
+        context.wait(0.2)
+        current = capture_visual_window(window)
+        current_descriptor = structure_descriptor(current)
+        structure_stable = descriptor_distance(previous_descriptor, current_descriptor) <= 0.008
+        content_change = changed_region(previous, current, threshold=16, padding=0)
+        content_stable = (
+            not content_sensitive
+            or content_change is None
+            or float(content_change.get("changedPixelRatio", 1.0)) <= 0.0005
+        )
+        if structure_stable and content_stable:
+            stable_count += 1
+        else:
+            stable_count = 0
+        if (
+            time.monotonic() - started >= max(0.0, minimum_wait)
+            and stable_count >= max(1, stable_samples)
+        ):
+            return current
+        previous, previous_descriptor = current, current_descriptor
+    return previous
+
+
+def descriptor_fingerprint(descriptor: dict[str, Any]) -> str:
+    value = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def same_visual_page_family(
+    candidate: dict[str, Any],
+    expected: dict[str, Any],
+) -> bool:
+    keys = ("locatorVersion", "page", "windowTitle", "className", "width", "height", "dpiScale")
+    return all(candidate.get(key) == expected.get(key) for key in keys)
+
+
+def persisted_page_candidates(expected: dict[str, Any]) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    if not VISUAL_MAP_ROOT.is_dir():
+        return candidates
+    paths = sorted(
+        VISUAL_MAP_ROOT.glob("page-*/layout.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for path in paths:
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        signature = value.get("signature")
+        descriptor = value.get("structureDescriptor")
+        if (
+            isinstance(signature, dict)
+            and isinstance(descriptor, dict)
+            and same_visual_page_family(signature, expected)
+        ):
+            candidates.append(value)
+    return candidates
+
+
+def visual_page_image(page_map: dict[str, Any]) -> Image.Image | None:
+    """Return a comparable full-window image for a memory or persisted page map."""
+
+    for key in ("currentSnapshot", "visualImage"):
+        image = page_map.get(key)
+        if isinstance(image, Image.Image):
+            return image
+    signature = page_map.get("signature")
+    if not isinstance(signature, dict):
+        return None
+    reference_path = visual_reference_path(signature)
+    if not reference_path.is_file():
+        return None
+    try:
+        with Image.open(reference_path) as reference:
+            return reference.convert("RGB")
+    except OSError:
+        return None
+
+
+def point_is_inside_bounds(point: Any, bounds: Any) -> bool:
+    if not (
+        isinstance(point, (list, tuple))
+        and len(point) >= 2
+        and isinstance(bounds, (list, tuple))
+        and len(bounds) == 4
+    ):
+        return False
+    try:
+        x, y = float(point[0]), float(point[1])
+        left, top, right, bottom = (float(value) for value in bounds)
+    except (TypeError, ValueError):
+        return False
+    return left <= x <= right and top <= y <= bottom
+
+
+def announce_visual_state(
+    context: ExecutionContext,
+    page_map: dict[str, Any],
+) -> None:
+    signature = page_map["signature"]
+    key = json.dumps(signature, ensure_ascii=False, sort_keys=True)
+    if context.state.get("active_visual_state") == key:
+        return
+    context.state["active_visual_state"] = key
+    event = page_map.get("stateEvent")
+    fingerprint = signature.get("stateFingerprint")
+    if event == "created":
+        if is_interactive_overlay_change(page_map.get("changeRegion")):
+            message = (
+                "检测到新的局部交互状态（菜单、日历或弹层），"
+                f"将建立独立 Map；状态={fingerprint}"
+            )
+        else:
+            message = f"检测到新的页面结构，将建立独立 Map；状态={fingerprint}"
+    else:
+        message = f"已匹配并复用页面 Map；状态={fingerprint}"
+    context.emit("info", message, None)
 
 
 def get_visual_page_map(
     context: ExecutionContext,
     window: Any,
     page: str = "current-page",
+    parent_page_map: dict[str, Any] | None = None,
+    force_new: bool = False,
+    prefer_changed_region: bool = False,
+    target_key: str | None = None,
 ) -> dict[str, Any]:
-    signature = visual_window_signature(window, page)
+    transition = context.state.get("pending_visual_page_transition")
+    if isinstance(transition, dict) and transition.get("page") == page:
+        context.state.pop("pending_visual_page_transition", None)
+        # Give an asynchronously rendered target page a short head start before
+        # testing stability, otherwise the closed-menu blank frame may look stable.
+        context.wait(0.35)
+    else:
+        transition = None
+    snapshot = capture_stable_visual_window(
+        context,
+        window,
+        timeout=8.0 if force_new else 2.0,
+        minimum_wait=0.8 if force_new else 0.0,
+        stable_samples=3 if force_new else 1,
+        content_sensitive=force_new,
+    )
+    descriptor = structure_descriptor(snapshot)
+    provisional = visual_window_signature(window, page, "")
     maps = context.state.setdefault("visual_page_maps", {})
+
+    # Prefer the live in-memory map when two candidates have the same descriptor.
+    # Its snapshot represents the state immediately before a menu was opened.
+    available: list[dict[str, Any]] = list(
+        item
+        for item in reversed(list(maps.values()))
+        if isinstance(item, dict)
+        and isinstance(item.get("signature"), dict)
+        and same_visual_page_family(item["signature"], provisional)
+        and isinstance(item.get("structureDescriptor"), dict)
+    )
+    available.extend(persisted_page_candidates(provisional))
+    excluded_fingerprints = {
+        str(value)
+        for value in ((transition or {}).get("excludedFingerprints") or [])
+        if value
+    }
+    if excluded_fingerprints:
+        available = [
+            candidate
+            for candidate in available
+            if str((candidate.get("signature") or {}).get("stateFingerprint") or "")
+            not in excluded_fingerprints
+        ]
+    best: dict[str, Any] | None = None
+    best_distance = 1.0
+    if not force_new:
+        for candidate in available:
+            distance = descriptor_distance(descriptor, candidate.get("structureDescriptor"))
+            if distance < best_distance:
+                best, best_distance = candidate, distance
+
+    overlay_parent: dict[str, Any] | None = None
+    overlay_change = None
+    # The desktop may be mostly blank, so a permissive whole-image threshold can
+    # hide a real page navigation. Tiny overlays are handled separately below.
+    reuse_threshold = 0.012 if transition else 0.02
+    if best is not None and best_distance <= reuse_threshold and prefer_changed_region:
+        base_image = visual_page_image(best)
+        if isinstance(base_image, Image.Image):
+            candidate_change = changed_region(base_image, snapshot)
+            cached_target = (best.get("targets") or {}).get(target_key) if target_key else None
+            if (
+                is_interactive_overlay_change(candidate_change)
+                and not point_is_inside_bounds(
+                    cached_target,
+                    candidate_change.get("bounds") if candidate_change else None,
+                )
+            ):
+                # A menu, calendar or popover appeared over an otherwise unchanged
+                # page. The old same-name coordinate must not win over its contents.
+                overlay_parent = best
+                overlay_change = candidate_change
+                best = None
+
+    # Small text/data changes stay on the same structural page. Larger layout
+    # changes and target-bearing overlays receive their own immutable state map.
+    if best is not None and best_distance <= reuse_threshold:
+        signature = dict(best["signature"])
+        persisted = load_visual_model(signature)
+        state_event = "reused"
+    else:
+        fingerprint = descriptor_fingerprint(descriptor)
+        if force_new or fingerprint in excluded_fingerprints:
+            fingerprint = f"{fingerprint}-{time.time_ns():x}"
+        signature = visual_window_signature(window, page, fingerprint)
+        persisted = {}
+        state_event = "created"
+
     cache_key = json.dumps(signature, ensure_ascii=False, sort_keys=True)
-    page_map = maps.get(cache_key)
-    if isinstance(page_map, dict):
-        return page_map
-    persisted = load_visual_model(signature)
+    cached = maps.get(cache_key)
+    if isinstance(cached, dict) and state_event == "reused":
+        cached["currentSnapshot"] = snapshot
+        cached["stateDistance"] = best_distance
+        announce_visual_state(context, cached)
+        return cached
+
     persisted_details = persisted.get("targetDetails", {})
     persisted_elements = persisted.get("elements", [])
     persisted_ambiguous = persisted.get("ambiguousTargets", {})
@@ -528,21 +873,45 @@ def get_visual_page_map(
     persisted_candidates = persisted.get("visualCandidates", [])
     persisted_unclassified = persisted.get("unclassified", [])
     persisted_raw_ocr = persisted.get("rawOcr", [])
+    persisted_descriptor = persisted.get("structureDescriptor", {})
+    persisted_classification_version = int(persisted.get("classificationVersion") or 0)
+    change = None
+    ocr_bounds = None
+    parent_signature = None
+    effective_parent = parent_page_map or overlay_parent
+    if state_event == "created" and isinstance(effective_parent, dict):
+        parent_signature = effective_parent.get("signature")
+        parent_image = visual_page_image(effective_parent)
+        if isinstance(parent_image, Image.Image):
+            change = overlay_change or changed_region(parent_image, snapshot)
+            if is_local_change(change):
+                ocr_bounds = list(change["bounds"])
+
     page_map = {
         "signature": signature,
-        "targets": load_visual_targets(signature),
+        "targets": persisted.get("targets", {}) if isinstance(persisted.get("targets"), dict) else {},
         "targetDetails": persisted_details if isinstance(persisted_details, dict) else {},
         "elements": persisted_elements if isinstance(persisted_elements, list) else [],
         "ambiguousTargets": persisted_ambiguous if isinstance(persisted_ambiguous, dict) else {},
         "ocrItems": None,
         "visualImage": None,
+        "pendingImage": snapshot if state_event == "created" else None,
+        "currentSnapshot": snapshot,
+        "ocrBounds": ocr_bounds,
+        "structureDescriptor": persisted_descriptor if isinstance(persisted_descriptor, dict) and persisted_descriptor else descriptor,
+        "parentSignature": persisted.get("parentSignature") or parent_signature,
+        "changeRegion": persisted.get("changeRegion") or change,
+        "stateEvent": state_event,
+        "stateDistance": best_distance if state_event == "reused" else None,
         "regions": persisted_regions if isinstance(persisted_regions, list) else [],
         "relationships": persisted_relationships if isinstance(persisted_relationships, list) else [],
         "visualCandidates": persisted_candidates if isinstance(persisted_candidates, list) else [],
         "unclassified": persisted_unclassified if isinstance(persisted_unclassified, list) else [],
         "persistedRawOcr": persisted_raw_ocr if isinstance(persisted_raw_ocr, list) else [],
+        "classificationVersion": persisted_classification_version,
     }
     maps[cache_key] = page_map
+    announce_visual_state(context, page_map)
     return page_map
 
 
@@ -585,26 +954,50 @@ def ensure_visual_ocr(
             with Image.open(reference_path) as reference:
                 page_map["visualImage"] = reference.convert("RGB")
             page_map["ocrItems"] = restored
-            if not page_map.get("elements"):
+            if page_map.get("classificationVersion", 0) < VISUAL_CLASSIFICATION_VERSION:
                 classify_visual_page(page_map)
                 save_visual_targets(page_map)
             return restored
 
-    rect = window.rectangle()
     screenshot_path = context.output_dir / (
         f".visual_map_{context.state['timestamp']}_{time.time_ns()}.png"
     )
     try:
-        with ImageGrab.grab(
-            bbox=(rect.left, rect.top, rect.right, rect.bottom)
-        ) as screenshot:
-            visual_image = screenshot.convert("RGB")
-            visual_image.save(screenshot_path)
+        pending = page_map.get("pendingImage")
+        visual_image = (
+            pending
+            if isinstance(pending, Image.Image)
+            else capture_visual_window(window)
+        )
+        ocr_bounds = page_map.get("ocrBounds")
+        if (
+            isinstance(ocr_bounds, list)
+            and len(ocr_bounds) == 4
+            and all(isinstance(value, int) for value in ocr_bounds)
+        ):
+            ocr_image = visual_image.crop(tuple(ocr_bounds))
+            offset_x, offset_y = ocr_bounds[0], ocr_bounds[1]
+        else:
+            ocr_image = visual_image
+            offset_x = offset_y = 0
+        ocr_image.save(screenshot_path)
         engine = context.state.get("ocr_engine")
         if engine is None:
             engine = marker.create_ocr_engine()
             context.state["ocr_engine"] = engine
-        items = marker.run_ocr(engine, screenshot_path)
+        detected_items = marker.run_ocr(engine, screenshot_path)
+        items = [
+            marker.OcrItem(
+                text=item.text,
+                score=item.score,
+                left=item.left + offset_x,
+                top=item.top + offset_y,
+                right=item.right + offset_x,
+                bottom=item.bottom + offset_y,
+                raw_text=item.raw_text,
+            )
+            for item in detected_items
+        ]
     finally:
         try:
             screenshot_path.unlink()
@@ -613,6 +1006,7 @@ def ensure_visual_ocr(
 
     page_map["ocrItems"] = items
     page_map["visualImage"] = visual_image
+    page_map["pendingImage"] = None
     page_map["regions"] = build_ocr_regions(items)
     page_map["relationships"] = build_ocr_relationships(items)
     classify_visual_page(page_map)
@@ -620,8 +1014,9 @@ def ensure_visual_ocr(
     context.emit(
         "info",
         (
-            f"已识别当前页面并完成整页控件预分类：{len(items)} 段文字，"
-            f"{len(page_map.get('visualCandidates', []))} 个形状控件候选"
+            f"已建立新的视觉状态地图并完成预分类：{len(items)} 段文字，"
+            f"{len(page_map.get('visualCandidates', []))} 个控件/表格候选；"
+            f"识别范围={'局部变化区域' if page_map.get('ocrBounds') else '完整窗口'}"
         ),
         None,
     )
@@ -633,6 +1028,122 @@ def local_point_to_screen(window: Any, point: list[int]) -> tuple[int, int]:
     return rect.left + int(point[0]), rect.top + int(point[1])
 
 
+def visual_foreground_bounds(page_map: dict[str, Any]) -> list[int] | None:
+    """Return the active dialog bounds, detecting it for older persisted maps."""
+
+    for region in page_map.get("regions") or []:
+        if isinstance(region, dict) and region.get("type") == "foreground-dialog":
+            bounds = region.get("bounds")
+            if isinstance(bounds, list) and len(bounds) == 4:
+                return bounds
+    image = visual_page_image(page_map)
+    if not isinstance(image, Image.Image):
+        return None
+    foreground = detect_foreground_panel(image)
+    if not isinstance(foreground, dict):
+        return None
+    bounds = foreground.get("bounds")
+    return bounds if isinstance(bounds, list) and len(bounds) == 4 else None
+
+
+def visual_toggle_anchor(
+    page_map: dict[str, Any],
+    state_texts: tuple[str, str],
+) -> tuple[list[int], list[int]] | None:
+    """Find a previously mapped toggle label without starting another OCR run."""
+
+    needles = [marker.normalize_ocr_text(text) for text in state_texts]
+    candidates: dict[tuple[int, int], tuple[list[int], list[int]]] = {}
+    for detail in (page_map.get("targetDetails") or {}).values():
+        if not isinstance(detail, dict):
+            continue
+        if str(detail.get("role") or "") not in {
+            "button",
+            "text-action",
+            "hover-trigger",
+            "menu-item",
+            "link",
+        }:
+            continue
+        name = marker.normalize_ocr_text(detail.get("name"))
+        point = detail.get("clickPoint")
+        bounds = detail.get("bounds")
+        if (
+            any(needle and needle in name for needle in needles)
+            and isinstance(point, list)
+            and len(point) == 2
+            and isinstance(bounds, list)
+            and len(bounds) == 4
+        ):
+            candidates[(int(point[0]), int(point[1]))] = (
+                [int(point[0]), int(point[1])],
+                [int(value) for value in bounds],
+            )
+
+    if not candidates:
+        raw_items = page_map.get("persistedRawOcr") or []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            text = marker.normalize_ocr_text(item.get("text") or item.get("rawText"))
+            bounds = item.get("bounds")
+            if (
+                any(needle and needle in text for needle in needles)
+                and isinstance(bounds, list)
+                and len(bounds) == 4
+            ):
+                left, top, right, bottom = (int(value) for value in bounds)
+                point = [(left + right) // 2, (top + bottom) // 2]
+                candidates[(point[0], point[1])] = (point, [left, top, right, bottom])
+
+    if len(candidates) == 1:
+        return next(iter(candidates.values()))
+    return None
+
+
+def local_visual_ocr(
+    context: ExecutionContext,
+    image: Image.Image,
+    bounds: list[int],
+) -> list[Any]:
+    """Run OCR only inside one small window-relative rectangle."""
+
+    left, top, right, bottom = bounds
+    temporary = context.output_dir / f".local_ocr_{time.time_ns()}.png"
+    try:
+        image.crop((left, top, right, bottom)).save(temporary)
+        engine = context.state.get("ocr_engine")
+        if engine is None:
+            engine = marker.create_ocr_engine()
+            context.state["ocr_engine"] = engine
+        detected = marker.run_ocr(engine, temporary)
+        return [
+            marker.OcrItem(
+                text=item.text,
+                score=item.score,
+                left=item.left + left,
+                top=item.top + top,
+                right=item.right + left,
+                bottom=item.bottom + top,
+                raw_text=item.raw_text,
+            )
+            for item in detected
+        ]
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def toggle_state_match(items: list[Any], text: str) -> Any | None:
+    """Return the best OCR item whose normalized text contains one state label."""
+
+    target = marker.normalize_ocr_text(text)
+    matches = [item for item in items if target and target in item.text]
+    return max(matches, key=lambda item: (item.score, -item.top, -item.left)) if matches else None
+
+
 def visual_text_point(
     context: ExecutionContext,
     window: Any,
@@ -640,14 +1151,31 @@ def visual_text_point(
     contains: bool = False,
     page: str = "current-page",
     role: str = "button",
+    parent_page_map: dict[str, Any] | None = None,
 ) -> tuple[int, int] | None:
     """Resolve visible text from a reusable per-page visual element map."""
 
-    page_map = get_visual_page_map(context, window, page)
     target_key = f"{role}:{'contains' if contains else 'exact'}:{target_name}"
+    page_map = get_visual_page_map(
+        context,
+        window,
+        page,
+        parent_page_map=parent_page_map,
+        prefer_changed_region=True,
+        target_key=target_key,
+    )
+    context.state["last_visual_resolved_map"] = page_map
+    foreground_bounds = visual_foreground_bounds(page_map)
     cached = page_map["targets"].get(target_key)
-    if cached is not None:
+    if cached is not None and (
+        foreground_bounds is None or point_is_inside_bounds(cached, foreground_bounds)
+    ):
         return local_point_to_screen(window, cached)
+    if cached is not None:
+        # A legacy map may have cached the same-name button from the dimmed
+        # background. Discard it and resolve again inside the active dialog.
+        page_map["targets"].pop(target_key, None)
+        page_map.get("targetDetails", {}).pop(target_key, None)
 
     items = ensure_visual_ocr(context, window, page_map)
     target = marker.normalize_ocr_text(target_name)
@@ -659,6 +1187,19 @@ def visual_text_point(
         matches = [item for item in items if target in item.text]
     if not matches:
         return None
+
+    if foreground_bounds is not None:
+        foreground_matches = [
+            item
+            for item in matches
+            if point_is_inside_bounds(
+                [(item.left + item.right) // 2, (item.top + item.bottom) // 2],
+                foreground_bounds,
+            )
+        ]
+        if not foreground_matches:
+            return None
+        matches = foreground_matches
 
     match = min(
         matches,
@@ -692,13 +1233,39 @@ def visual_input_point(
 
     page_map = get_visual_page_map(context, window, page)
     target_key = f"input:{field_name}"
+    foreground_bounds = visual_foreground_bounds(page_map)
     cached = page_map["targets"].get(target_key)
     if cached is not None:
-        return local_point_to_screen(window, cached)
+        detail = page_map.get("targetDetails", {}).get(target_key, {})
+        if foreground_bounds is not None and not point_is_inside_bounds(
+            cached, foreground_bounds
+        ):
+            page_map["targets"].pop(target_key, None)
+            page_map.get("targetDetails", {}).pop(target_key, None)
+        elif not isinstance(detail, dict) or not detail.get("labelBounds"):
+            return local_point_to_screen(window, cached)
+        elif input_bounds_match_label(
+            detail.get("bounds"),
+            detail.get("labelBounds"),
+            str(detail.get("relation") or ""),
+        ):
+            return local_point_to_screen(window, cached)
+        else:
+            page_map["targets"].pop(target_key, None)
+            page_map.get("targetDetails", {}).pop(target_key, None)
 
     items = ensure_visual_ocr(context, window, page_map)
     target = marker.normalize_ocr_text(field_name)
     labels = [item for item in items if item.text == target]
+    if foreground_bounds is not None:
+        labels = [
+            item
+            for item in labels
+            if point_is_inside_bounds(
+                [(item.left + item.right) // 2, (item.top + item.bottom) // 2],
+                foreground_bounds,
+            )
+        ]
     if not labels:
         return None
 
@@ -747,12 +1314,38 @@ def visual_select_point(
 
     page_map = get_visual_page_map(context, window, page)
     target_key = f"select:{field_name}"
+    foreground_bounds = visual_foreground_bounds(page_map)
     cached = page_map["targets"].get(target_key)
     if cached is not None:
-        return local_point_to_screen(window, cached)
+        detail = page_map.get("targetDetails", {}).get(target_key, {})
+        if foreground_bounds is not None and not point_is_inside_bounds(
+            cached, foreground_bounds
+        ):
+            page_map["targets"].pop(target_key, None)
+            page_map.get("targetDetails", {}).pop(target_key, None)
+        elif not isinstance(detail, dict) or not detail.get("labelBounds"):
+            return local_point_to_screen(window, cached)
+        elif input_bounds_match_label(
+            detail.get("bounds"),
+            detail.get("labelBounds"),
+            str(detail.get("relation") or ""),
+        ):
+            return local_point_to_screen(window, cached)
+        else:
+            page_map["targets"].pop(target_key, None)
+            page_map.get("targetDetails", {}).pop(target_key, None)
     items = ensure_visual_ocr(context, window, page_map)
     target = marker.normalize_ocr_text(field_name)
     labels = [item for item in items if item.text == target]
+    if foreground_bounds is not None:
+        labels = [
+            item
+            for item in labels
+            if point_is_inside_bounds(
+                [(item.left + item.right) // 2, (item.top + item.bottom) // 2],
+                foreground_bounds,
+            )
+        ]
     visual_image = page_map.get("visualImage")
     if not labels or not isinstance(visual_image, Image.Image):
         return None
@@ -790,13 +1383,36 @@ def visual_checkbox_point(
 
     page_map = get_visual_page_map(context, window, page)
     target_key = f"checkbox:{checkbox_name}"
+    foreground_bounds = visual_foreground_bounds(page_map)
     cached = page_map["targets"].get(target_key)
     if cached is not None:
-        return local_point_to_screen(window, cached)
+        detail = page_map.get("targetDetails", {}).get(target_key, {})
+        if (
+            (foreground_bounds is None or point_is_inside_bounds(cached, foreground_bounds))
+            and isinstance(detail, dict)
+            and detail.get("locatorVersion") == VISUAL_CHECKBOX_LOCATOR_VERSION
+            and checkbox_bounds_match_label(
+                detail.get("bounds"),
+                detail.get("labelBounds"),
+                str(detail.get("relation") or ""),
+            )
+        ):
+            return local_point_to_screen(window, cached)
+        page_map["targets"].pop(target_key, None)
+        page_map.get("targetDetails", {}).pop(target_key, None)
 
     items = ensure_visual_ocr(context, window, page_map)
     target = marker.normalize_ocr_text(checkbox_name)
     labels = [item for item in items if item.text == target]
+    if foreground_bounds is not None:
+        labels = [
+            item
+            for item in labels
+            if point_is_inside_bounds(
+                [(item.left + item.right) // 2, (item.top + item.bottom) // 2],
+                foreground_bounds,
+            )
+        ]
     if not labels:
         return None
 
@@ -822,6 +1438,7 @@ def visual_checkbox_point(
         "relation": square["relation"],
         "confidence": square["score"],
         "source": "ocr+shape",
+        "locatorVersion": VISUAL_CHECKBOX_LOCATOR_VERSION,
     }
     page_map["visualCandidates"].append(
         {
@@ -921,6 +1538,7 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
 
     window = current_window(context)
     page = visual_page_id(params)
+    source_map = get_visual_page_map(context, window, page)
     point = visual_select_point(context, window, field_name, page=page)
     if point is not None:
         mouse.click(button="left", coords=point)
@@ -933,6 +1551,7 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
             contains=False,
             page=option_page,
             role="option",
+            parent_page_map=source_map,
         )
         if option_point is not None:
             mouse.click(button="left", coords=option_point)
@@ -1056,17 +1675,34 @@ def run_his_click_object(context: ExecutionContext, params: dict[str, Any]) -> d
         raise WorkflowExecutionError("点击对象匹配方式无效")
 
     window = current_window(context)
+    page = visual_page_id(params)
+    context.state.pop("last_visual_resolved_map", None)
     control_types = allowed_types if control_type == "自动" else {control_type}
     point = visual_text_point(
         context,
         window,
         target_name,
         contains=match_mode == "包含文字",
-        page=visual_page_id(params),
+        page=page,
     )
     if point is not None:
         mouse.click(button="left", coords=point)
         locator_mode = "visual-map"
+        resolved_map = context.state.get("last_visual_resolved_map")
+        if isinstance(resolved_map, dict) and resolved_map.get("parentSignature"):
+            signatures = [
+                resolved_map.get("signature"),
+                resolved_map.get("parentSignature"),
+            ]
+            context.state["pending_visual_page_transition"] = {
+                "page": page,
+                "trigger": target_name,
+                "excludedFingerprints": [
+                    signature.get("stateFingerprint")
+                    for signature in signatures
+                    if isinstance(signature, dict)
+                ],
+            }
     else:
         control = find_named_his_control(
             window,
@@ -2147,31 +2783,30 @@ def run_visual_map_page(
     context: ExecutionContext,
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build or load a reusable visual model for the current application page."""
+    """Force a complete OCR and preclassification of the current full window."""
 
     window = current_window(context)
     page = visual_page_id(params)
-    page_map = get_visual_page_map(context, window, page)
-    if bool(params.get("forceRefresh", False)):
-        page_map.update(
-            {
-                "targets": {},
-                "targetDetails": {},
-                "elements": [],
-                "ambiguousTargets": {},
-                "ocrItems": None,
-                "visualImage": None,
-                "regions": [],
-                "relationships": [],
-                "visualCandidates": [],
-                "unclassified": [],
-                "persistedRawOcr": [],
-            }
-        )
+    page_load_wait = float(params.get("pageLoadWaitSeconds", 1.5))
+    if not 0 <= page_load_wait <= 30:
+        raise WorkflowExecutionError("页面加载等待时间必须在 0～30 秒之间")
+    if page_load_wait:
+        context.emit("info", f"等待页面加载稳定（至少 {page_load_wait:g} 秒）", None)
+        context.wait(page_load_wait)
+    page_map = get_visual_page_map(
+        context,
+        window,
+        page,
+        force_new=True,
+    )
     items = ensure_visual_ocr(context, window, page_map)
     path = visual_map_path(page_map["signature"])
     return {
         "page": page,
+        "stateFingerprint": page_map["signature"].get("stateFingerprint"),
+        "stateEvent": page_map.get("stateEvent"),
+        "stateDistance": page_map.get("stateDistance"),
+        "recognitionScope": "local-change" if page_map.get("ocrBounds") else "full-window",
         "layoutPath": str(path),
         "textCount": len(items),
         "elementCount": len(page_map.get("elements", [])),
@@ -2182,6 +2817,313 @@ def run_visual_map_page(
         "regionCount": len(page_map.get("regions", [])),
         "relationshipCount": len(page_map.get("relationships", [])),
     }
+
+
+def run_visual_refresh_page(
+    context: ExecutionContext,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Compatibility alias for forced full-window page mapping."""
+
+    context.state.pop("pending_visual_page_transition", None)
+    result = run_visual_map_page(context, params)
+    result["manualRefresh"] = True
+    result["forced"] = True
+    context.emit(
+        "info",
+        f"已强制完成整页 OCR、预分类并保存新 Map；页面={result['page']}",
+        None,
+    )
+    return result
+
+
+def infer_date_order(
+    page_map: dict[str, Any],
+    local_bounds: list[int],
+) -> str:
+    """Infer date segment order from placeholder text inside the field."""
+
+    left, top, right, bottom = local_bounds
+    fragments: list[str] = []
+    for item in page_map.get("ocrItems") or []:
+        center_x = (item.left + item.right) // 2
+        center_y = (item.top + item.bottom) // 2
+        if left <= center_x <= right and top <= center_y <= bottom:
+            fragments.append(str(item.raw_text or item.text or ""))
+    placeholder = "".join(fragments).lower()
+    tokens = {
+        "年": min(
+            [position for token in ("年", "yyyy", "year") if (position := placeholder.find(token)) >= 0]
+            or [10_000]
+        ),
+        "月": min(
+            [position for token in ("月", "mm", "month") if (position := placeholder.find(token)) >= 0]
+            or [10_000]
+        ),
+        "日": min(
+            [position for token in ("日", "dd", "day") if (position := placeholder.find(token)) >= 0]
+            or [10_000]
+        ),
+    }
+    if all(position < 10_000 for position in tokens.values()):
+        return "".join(sorted(tokens, key=tokens.get))
+    return "年月日"
+
+
+def date_segment_local_points(
+    page_map: dict[str, Any],
+    local_bounds: list[int],
+) -> list[list[int]]:
+    """Locate the three editable date segments, excluding the calendar button."""
+
+    left, top, right, bottom = local_bounds
+    field_width = right - left
+    calendar_width = min(34, max(20, round(field_width * 0.18)))
+    content_right = right - calendar_width
+    candidates = []
+    for item in page_map.get("ocrItems") or []:
+        center_x = (item.left + item.right) // 2
+        center_y = (item.top + item.bottom) // 2
+        raw_text = str(item.raw_text or item.text or "")
+        if (
+            left <= center_x <= content_right
+            and top <= center_y <= bottom
+            and (any(token in raw_text.lower() for token in ("年", "月", "日", "y", "m", "d"))
+                 or any(character.isdigit() for character in raw_text))
+        ):
+            candidates.append(item)
+
+    if candidates:
+        text_item = max(candidates, key=lambda item: item.right - item.left)
+        segment_left = max(left + 2, text_item.left)
+        segment_right = min(content_right, text_item.right)
+        if segment_right - segment_left >= 30:
+            return [
+                [
+                    segment_left + round((segment_right - segment_left) * (index * 2 + 1) / 6),
+                    (top + bottom) // 2,
+                ]
+                for index in range(3)
+            ]
+
+    # Empty or low-confidence placeholders normally occupy the leading portion
+    # of a date field rather than the full area before the calendar icon.
+    segment_right = left + round(max(30, content_right - left) * 0.68)
+    return [
+        [
+            left + round((segment_right - left) * (index * 2 + 1) / 6),
+            (top + bottom) // 2,
+        ]
+        for index in range(3)
+    ]
+
+
+def run_his_input_date(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
+    """Fill a visually located segmented date control without relying on UIA."""
+
+    field_name = str(params.get("fieldName") or "").strip()
+    date_value = str(params.get("dateValue") or "").strip()
+    requested_order = str(params.get("dateOrder") or "自动识别").strip()
+    confirm_key = str(params.get("confirmKey") or "Tab").strip()
+    segment_pause = float(params.get("segmentPauseSeconds", 0.12))
+    if not field_name:
+        raise WorkflowExecutionError("日期字段名称不能为空")
+    try:
+        parsed = datetime.date.fromisoformat(date_value)
+    except ValueError as exc:
+        raise WorkflowExecutionError(
+            f"日期“{date_value}”格式无效，请使用 YYYY-MM-DD"
+        ) from exc
+    if requested_order not in {"自动识别", "年月日", "月日年", "日月年"}:
+        raise WorkflowExecutionError("日期显示顺序无效")
+    if confirm_key not in {"Tab", "Enter", "不发送"}:
+        raise WorkflowExecutionError("日期确认方式无效")
+    if not 0 <= segment_pause <= 2:
+        raise WorkflowExecutionError("日期分段输入间隔必须在 0～2 秒之间")
+
+    window = current_window(context)
+    page = visual_page_id(params)
+    point = visual_input_point(context, window, field_name, page=page)
+    if point is None:
+        raise WorkflowExecutionError(
+            f"视觉页面布局中未找到日期字段“{field_name}”"
+        )
+
+    page_map = get_visual_page_map(context, window, page)
+    detail = page_map.get("targetDetails", {}).get(f"input:{field_name}", {})
+    bounds = detail.get("bounds") if isinstance(detail, dict) else None
+    if not (
+        isinstance(bounds, list)
+        and len(bounds) == 4
+        and all(isinstance(value, int) for value in bounds)
+    ):
+        raise WorkflowExecutionError(
+            f"日期字段“{field_name}”已有中心坐标，但布局中缺少输入框边界；请强制重新识别页面布局"
+        )
+
+    order = infer_date_order(page_map, bounds) if requested_order == "自动识别" else requested_order
+    parts = {
+        "年": f"{parsed.year:04d}",
+        "月": str(parsed.month),
+        "日": str(parsed.day),
+    }
+    rect = window.rectangle()
+    local_left, local_top, local_right, local_bottom = bounds
+    local_segment_points = date_segment_local_points(page_map, bounds)
+    segment_points = [
+        (rect.left + point[0], rect.top + point[1])
+        for point in local_segment_points
+    ]
+    # Segmented native date controls keep one focus across year/month/day.
+    # Click the first segment once, then move between segments with Right so
+    # approximate per-segment coordinates cannot focus the wrong date part.
+    mouse.click(button="left", coords=segment_points[0])
+    time.sleep(0.08)
+    for index, segment in enumerate(order):
+        send_keys(parts[segment], pause=0.06)
+        if index < len(order) - 1:
+            send_keys("{RIGHT}", pause=0.06)
+            if segment_pause:
+                context.wait(segment_pause)
+    if confirm_key == "Tab":
+        send_keys("{TAB}", pause=0.08)
+    elif confirm_key == "Enter":
+        send_keys("{ENTER}", pause=0.08)
+
+    context.emit(
+        "info",
+        (
+            f"已填写日期字段“{field_name}”={date_value}；分段顺序={order}；"
+            "切换方式=右方向键；定位方式=visual-map"
+        ),
+        None,
+    )
+    return {
+        "fieldName": field_name,
+        "dateValue": date_value,
+        "dateOrder": order,
+        "confirmKey": confirm_key,
+        "segmentNavigation": "Right",
+        "locatorMode": "visual-map",
+        "point": list(segment_points[0]),
+        "segmentPoints": [list(point) for point in segment_points],
+        "bounds": [
+            rect.left + local_left,
+            rect.top + local_top,
+            rect.left + local_right,
+            rect.top + local_bottom,
+        ],
+    }
+
+
+def run_visual_ensure_expanded(
+    context: ExecutionContext,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Use small-area OCR to make a mapped expand/collapse toggle idempotent."""
+
+    collapsed_text = str(params.get("collapsedText") or "").strip()
+    expanded_text = str(params.get("expandedText") or "").strip()
+    horizontal_padding = int(params.get("horizontalPadding", 100))
+    vertical_padding = int(params.get("verticalPadding", 40))
+    wait_after_click = float(params.get("waitAfterClickSeconds", 0.3))
+    if not collapsed_text or not expanded_text:
+        raise WorkflowExecutionError("折叠状态文字和展开状态文字不能为空")
+    if marker.normalize_ocr_text(collapsed_text) == marker.normalize_ocr_text(expanded_text):
+        raise WorkflowExecutionError("折叠状态文字和展开状态文字不能相同")
+    if not 10 <= horizontal_padding <= 500 or not 10 <= vertical_padding <= 300:
+        raise WorkflowExecutionError("局部 OCR 范围参数无效")
+    if not 0 <= wait_after_click <= 10:
+        raise WorkflowExecutionError("点击后等待时间必须在 0～10 秒之间")
+
+    window = current_window(context)
+    page = visual_page_id(params)
+    provisional = visual_window_signature(window, page, "")
+    in_memory = [
+        item
+        for item in reversed(
+            list((context.state.get("visual_page_maps") or {}).values())
+        )
+        if isinstance(item, dict)
+        and isinstance(item.get("signature"), dict)
+        and same_visual_page_family(item["signature"], provisional)
+    ]
+    candidates = in_memory + persisted_page_candidates(provisional)
+    anchors: list[tuple[list[int], list[int]]] = []
+    seen_points: set[tuple[int, int]] = set()
+    for candidate in candidates:
+        anchor = visual_toggle_anchor(
+            candidate,
+            (collapsed_text, expanded_text),
+        )
+        if anchor is None:
+            continue
+        point_key = (anchor[0][0], anchor[0][1])
+        if point_key not in seen_points:
+            seen_points.add(point_key)
+            anchors.append(anchor)
+    if not anchors:
+        raise WorkflowExecutionError(
+            "已有页面 Map 中未找到展开/收起状态文字，无法确定局部 OCR 区域；请先建立当前页面布局"
+        )
+
+    snapshot = capture_visual_window(window)
+    for _anchor_point, anchor_bounds in anchors[:8]:
+        left = max(0, anchor_bounds[0] - horizontal_padding)
+        top = max(0, anchor_bounds[1] - vertical_padding)
+        right = min(snapshot.width, anchor_bounds[2] + horizontal_padding)
+        bottom = min(snapshot.height, anchor_bounds[3] + vertical_padding)
+        bounds = [left, top, right, bottom]
+        items = local_visual_ocr(context, snapshot, bounds)
+        expanded_match = toggle_state_match(items, expanded_text)
+        if expanded_match is not None:
+            point = [
+                (expanded_match.left + expanded_match.right) // 2,
+                (expanded_match.top + expanded_match.bottom) // 2,
+            ]
+            context.emit(
+                "info",
+                f"局部 OCR 检测到“{expanded_text}”，区域已经展开，本次不点击",
+                None,
+            )
+            return {
+                "state": "expanded",
+                "clicked": False,
+                "matchedText": expanded_match.text,
+                "point": point,
+                "ocrBounds": bounds,
+                "recognitionScope": "local",
+            }
+
+        collapsed_match = toggle_state_match(items, collapsed_text)
+        if collapsed_match is not None:
+            local_point = [
+                (collapsed_match.left + collapsed_match.right) // 2,
+                (collapsed_match.top + collapsed_match.bottom) // 2,
+            ]
+            mouse.click(
+                button="left",
+                coords=local_point_to_screen(window, local_point),
+            )
+            if wait_after_click:
+                context.wait(wait_after_click)
+            context.emit(
+                "info",
+                f"局部 OCR 检测到“{collapsed_text}”，已点击并展开",
+                None,
+            )
+            return {
+                "state": "collapsed",
+                "clicked": True,
+                "matchedText": collapsed_match.text,
+                "point": local_point,
+                "ocrBounds": bounds,
+                "recognitionScope": "local",
+            }
+
+    raise WorkflowExecutionError(
+        f"局部 OCR 未识别到“{collapsed_text}”或“{expanded_text}”，未执行点击"
+    )
 
 
 def run_visual_hover_object(
@@ -2202,6 +3144,7 @@ def run_visual_hover_object(
         params.get("hoverPage") or f"{source_page}:hover:{target_name}"
     ).strip()[:80]
     window = current_window(context)
+    source_map = get_visual_page_map(context, window, source_page)
     point = visual_text_point(
         context,
         window,
@@ -2222,7 +3165,12 @@ def run_visual_hover_object(
         locator_mode = "uia-control"
     mouse.move(coords=point)
     context.wait(wait_seconds)
-    hover_map = get_visual_page_map(context, window, hover_page)
+    hover_map = get_visual_page_map(
+        context,
+        window,
+        hover_page,
+        parent_page_map=source_map,
+    )
     hover_items = ensure_visual_ocr(context, window, hover_map)
     return {
         "targetName": target_name,
@@ -2305,12 +3253,23 @@ def build_registry() -> WorkflowRegistry:
             "visual.map_page",
             "识别并保存当前页面布局",
             "视觉",
-            "首次截图并建立通用页面模型；已有匹配模型时直接加载。",
+            "每次执行都等待页面稳定，强制进行完整窗口 OCR 和整页预分类，并保存为新 Map。",
             (
                 visual_page_field(),
-                field("forceRefresh", "强制重新识别", "boolean", False),
+                field("pageLoadWaitSeconds", "页面加载等待（秒）", "number", 1.5, min=0, max=30, step=0.5),
             ),
             run_visual_map_page,
+        ),
+        ModuleDefinition(
+            "visual.refresh_page",
+            "重新识别整页",
+            "视觉",
+            "兼容模块：等待页面稳定后强制完成完整窗口 OCR 和整页预分类，并保存为新 Map。",
+            (
+                visual_page_field(),
+                field("pageLoadWaitSeconds", "页面加载等待（秒）", "number", 1.5, min=0, max=30, step=0.5),
+            ),
+            run_visual_refresh_page,
         ),
         ModuleDefinition(
             "visual.hover_object",
@@ -2327,10 +3286,25 @@ def build_registry() -> WorkflowRegistry:
             run_visual_hover_object,
         ),
         ModuleDefinition(
+            "visual.ensure_expanded",
+            "确保区域已展开（局部 OCR）",
+            "视觉",
+            "只识别已有位置附近的小区域；检测到展开状态时跳过，检测到折叠状态时才点击。",
+            (
+                field("collapsedText", "折叠状态文字", "text", "更多"),
+                field("expandedText", "展开状态文字", "text", "收起"),
+                visual_page_field(),
+                field("horizontalPadding", "左右识别范围（像素）", "number", 100, min=10, max=500, step=10),
+                field("verticalPadding", "上下识别范围（像素）", "number", 40, min=10, max=300, step=10),
+                field("waitAfterClickSeconds", "点击后等待（秒）", "number", 0.3, min=0, max=10, step=0.1),
+            ),
+            run_visual_ensure_expanded,
+        ),
+        ModuleDefinition(
             "his.input_field",
             "填写 HIS 字段并回车",
             "HIS",
-            "字段名称和填写内容均可配置；优先 UIA，失败时按患者查询网格定位。",
+            "通过 OCR 页面布局定位并填写普通文本字段。",
             (
                 field("fieldName", "目标字段名称", "text", "卡号"),
                 field("value", "填写内容/变量", "text", ""),
@@ -2339,6 +3313,41 @@ def build_registry() -> WorkflowRegistry:
                 field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
             ),
             run_his_input_field,
+        ),
+        ModuleDefinition(
+            "his.input_date",
+            "HIS 填写日期",
+            "HIS",
+            "通过 OCR 页面布局定位日期框；点击首个日期段后，用右方向键依次切换并填写各段。",
+            (
+                field("fieldName", "日期字段名称", "text", "开始日期"),
+                field("dateValue", "日期/变量（YYYY-MM-DD）", "text", ""),
+                field(
+                    "dateOrder",
+                    "控件日期顺序",
+                    "select",
+                    "自动识别",
+                    options=["自动识别", "年月日", "月日年", "日月年"],
+                ),
+                field(
+                    "confirmKey",
+                    "填写后确认方式",
+                    "select",
+                    "Tab",
+                    options=["Tab", "Enter", "不发送"],
+                ),
+                field(
+                    "segmentPauseSeconds",
+                    "日期段切换间隔（秒）",
+                    "number",
+                    0.12,
+                    min=0,
+                    max=2,
+                    step=0.01,
+                ),
+                visual_page_field(),
+            ),
+            run_his_input_date,
         ),
         ModuleDefinition(
             "his.select_option",
