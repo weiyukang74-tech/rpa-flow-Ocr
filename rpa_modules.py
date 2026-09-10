@@ -6,13 +6,18 @@ import ctypes
 import datetime
 import hashlib
 import json
+import sys
 import time
 from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageGrab
 
-STUDIO_ROOT = Path(__file__).resolve().parent
+STUDIO_ROOT = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
 
 import his_automation as window_adapter
 import ocr_marker as marker
@@ -193,8 +198,18 @@ def save_visual_targets(page_map: dict[str, Any]) -> None:
         }
         for index, item in enumerate(page_map.get("ocrItems") or [])
     ]
+    raw_weak_ocr = [
+        {
+            "id": f"weak-text-{index:04d}",
+            "text": item.text,
+            "rawText": item.raw_text,
+            "score": round(float(item.score), 5),
+            "bounds": [item.left, item.top, item.right, item.bottom],
+        }
+        for index, item in enumerate(page_map.get("weakOcrItems") or [])
+    ]
     payload = {
-        "schemaVersion": 6,
+        "schemaVersion": 7,
         "classificationVersion": page_map.get("classificationVersion", 0),
         "signature": page_map["signature"],
         "targets": page_map["targets"],
@@ -205,9 +220,11 @@ def save_visual_targets(page_map: dict[str, Any]) -> None:
         "parentSignature": page_map.get("parentSignature"),
         "changeRegion": page_map.get("changeRegion"),
         "rawOcr": raw_ocr,
+        "rawWeakOcr": raw_weak_ocr,
         "regions": page_map.get("regions", []),
         "relationships": page_map.get("relationships", []),
         "visualCandidates": page_map.get("visualCandidates", []),
+        "weakCandidates": page_map.get("weakCandidates", []),
         "unclassified": page_map.get("unclassified", []),
         "performance": page_map.get("performance", {}),
     }
@@ -296,8 +313,8 @@ def build_ocr_relationships(items: list[Any]) -> list[dict[str, Any]]:
     return relationships
 
 
-VISUAL_CLASSIFICATION_VERSION = 3
-VISUAL_CHECKBOX_LOCATOR_VERSION = 3
+VISUAL_CLASSIFICATION_VERSION = 7
+VISUAL_CHECKBOX_LOCATOR_VERSION = 4
 
 
 def classify_visual_page(page_map: dict[str, Any]) -> None:
@@ -311,6 +328,7 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
 
     elements: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
+    weak_candidates: list[dict[str, Any]] = []
     occurrences: dict[str, list[int]] = {}
     actionable_occurrences: dict[str, list[int]] = {}
     resolved_text_ids: set[str] = set()
@@ -332,13 +350,17 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
         ]
 
     ocr_bounds = page_map.get("ocrBounds")
+    dpi_scale = float(
+        (page_map.get("signature") or {}).get("dpiScale") or 1.0
+    )
     if (
         isinstance(ocr_bounds, list)
         and len(ocr_bounds) == 4
         and all(isinstance(value, int) for value in ocr_bounds)
     ):
         control_inventory = detect_visual_control_candidates(
-            image.crop(tuple(ocr_bounds))
+            image.crop(tuple(ocr_bounds)),
+            dpi_scale=dpi_scale,
         )
         for group in control_inventory.values():
             for candidate in group:
@@ -353,7 +375,10 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
                     candidate["center"][1] + ocr_bounds[1],
                 ]
     else:
-        control_inventory = detect_visual_control_candidates(image)
+        control_inventory = detect_visual_control_candidates(
+            image,
+            dpi_scale=dpi_scale,
+        )
     primitive_seconds = time.perf_counter() - primitive_started
 
     def is_in_foreground(item: Any) -> bool:
@@ -371,26 +396,98 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
                 return table_index, table
         return None
 
-    def candidate_allowed(candidate: dict[str, Any]) -> bool:
+    def candidate_context_reasons(candidate: dict[str, Any]) -> list[str]:
+        reasons: list[str] = []
         if foreground_bounds is not None and not point_is_inside_bounds(
             candidate.get("center"), foreground_bounds
         ):
-            return False
-        return not any(
+            reasons.append("outside-foreground")
+        if any(
             point_is_inside_bounds(candidate.get("center"), table["bounds"])
             for table in table_regions
+        ):
+            reasons.append("inside-table")
+        return reasons
+
+    def candidate_allowed(
+        candidate: dict[str, Any],
+        *,
+        exclude_tables: bool,
+    ) -> bool:
+        reasons = candidate_context_reasons(candidate)
+        return not any(
+            reason == "outside-foreground"
+            or (exclude_tables and reason == "inside-table")
+            for reason in reasons
         )
+
+    for index, item in enumerate(page_map.get("weakOcrItems") or []):
+        bounds = [item.left, item.top, item.right, item.bottom]
+        center = [
+            (item.left + item.right) // 2,
+            (item.top + item.bottom) // 2,
+        ]
+        weak_text = {
+            "id": f"weak-text-{index:04d}",
+            "kind": "text",
+            "text": item.text,
+            "rawText": item.raw_text,
+            "bounds": bounds,
+            "center": center,
+            "confidence": round(float(item.score), 5),
+            "confidenceLevel": "weak",
+            "possibleRoles": ["text", "button", "label", "menu-item"],
+            "source": "low-confidence-ocr",
+            "weakReasons": ["low-ocr-confidence"],
+            "activeForDefaultMatching": False,
+        }
+        weak_text["contextReasons"] = candidate_context_reasons(weak_text)
+        weak_candidates.append(weak_text)
 
     field_candidates = [
         candidate
         for candidate in control_inventory.get("fieldRectangles", [])
-        if candidate_allowed(candidate)
+        if candidate_allowed(candidate, exclude_tables=True)
     ]
     square_candidates = [
         candidate
         for candidate in control_inventory.get("squareControls", [])
-        if candidate_allowed(candidate)
+        if candidate_allowed(candidate, exclude_tables=False)
     ]
+    weak_field_candidates = list(
+        control_inventory.get("weakFieldRectangles", [])
+    )
+    weak_square_candidates = list(
+        control_inventory.get("weakSquareControls", [])
+    )
+
+    # Strong geometric candidates excluded by foreground/table context are not
+    # discarded. Keep them in the weak pool, where normal target matching will
+    # not use them automatically.
+    for candidate in control_inventory.get("fieldRectangles", []):
+        reasons = candidate_context_reasons(candidate)
+        if reasons:
+            weak_field_candidates.append(
+                {
+                    **candidate,
+                    "confidenceLevel": "weak",
+                    "weakReasons": ["context-filtered", *reasons],
+                }
+            )
+    for candidate in control_inventory.get("squareControls", []):
+        reasons = [
+            reason
+            for reason in candidate_context_reasons(candidate)
+            if reason == "outside-foreground"
+        ]
+        if reasons:
+            weak_square_candidates.append(
+                {
+                    **candidate,
+                    "confidenceLevel": "weak",
+                    "weakReasons": ["context-filtered", *reasons],
+                }
+            )
     candidates.extend(
         {
             "id": f"field-candidate-{index:04d}",
@@ -408,6 +505,30 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
             **candidate,
         }
         for index, candidate in enumerate(square_candidates)
+    )
+    weak_candidates.extend(
+        {
+            "id": f"weak-field-candidate-{index:04d}",
+            "kind": "field-rectangle",
+            "possibleRoles": ["input", "select", "date"],
+            "confidenceLevel": "weak",
+            "activeForDefaultMatching": False,
+            **candidate,
+            "contextReasons": candidate_context_reasons(candidate),
+        }
+        for index, candidate in enumerate(weak_field_candidates)
+    )
+    weak_candidates.extend(
+        {
+            "id": f"weak-square-candidate-{index:04d}",
+            "kind": "square-control",
+            "possibleRoles": ["checkbox", "toggle", "icon"],
+            "confidenceLevel": "weak",
+            "activeForDefaultMatching": False,
+            **candidate,
+            "contextReasons": candidate_context_reasons(candidate),
+        }
+        for index, candidate in enumerate(weak_square_candidates)
     )
 
     table_first_rows: dict[int, int] = {}
@@ -499,20 +620,85 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
             page_map["targets"].pop(key, None)
             page_map.get("targetDetails", {}).pop(key, None)
 
-    for index, label in enumerate(items):
-        if (
-            table_for_item(label) is not None
-            or (foreground_bounds is not None and not is_in_foreground(label))
+    eligible_field_label_indexes = [
+        index
+        for index, label in enumerate(items)
+        if table_for_item(label) is None
+        and not (foreground_bounds is not None and not is_in_foreground(label))
+        and marker.normalize_ocr_text(label.text)
+    ]
+    eligible_square_label_indexes = [
+        index
+        for index, label in enumerate(items)
+        if not (foreground_bounds is not None and not is_in_foreground(label))
+        and marker.normalize_ocr_text(label.text)
+    ]
+
+    def allocate_one_to_one(
+        control_candidates: list[dict[str, Any]],
+        label_indexes: list[int],
+        matcher: Any,
+    ) -> dict[int, dict[str, Any]]:
+        scored_pairs: list[tuple[float, int, int, dict[str, Any]]] = []
+        for label_index in label_indexes:
+            label = items[label_index]
+            for candidate_index, control_candidate in enumerate(control_candidates):
+                match = matcher([control_candidate], label)
+                if match is not None:
+                    scored_pairs.append(
+                        (
+                            float(match.get("score") or 0.0),
+                            label_index,
+                            candidate_index,
+                            match,
+                        )
+                    )
+        assigned_labels: set[int] = set()
+        assigned_candidates: set[int] = set()
+        assignments: dict[int, dict[str, Any]] = {}
+        for _score, label_index, candidate_index, match in sorted(
+            scored_pairs,
+            key=lambda value: value[0],
+            reverse=True,
         ):
+            if (
+                label_index in assigned_labels
+                or candidate_index in assigned_candidates
+            ):
+                continue
+            assignments[label_index] = match
+            assigned_labels.add(label_index)
+            assigned_candidates.add(candidate_index)
+        return assignments
+
+    square_assignments = allocate_one_to_one(
+        square_candidates,
+        eligible_square_label_indexes,
+        match_checkbox_candidate,
+    )
+    field_assignments = allocate_one_to_one(
+        field_candidates,
+        [
+            index
+            for index in eligible_field_label_indexes
+            if index not in square_assignments
+        ],
+        match_input_candidate,
+    )
+
+    for index, label in enumerate(items):
+        if foreground_bounds is not None and not is_in_foreground(label):
             continue
         normalized = marker.normalize_ocr_text(label.text)
         if not normalized:
             continue
         label_id = f"text-{index:04d}"
+        label_is_in_table = table_for_item(label) is not None
         unique_label = len(actionable_occurrences.get(normalized, [])) == 1
+        unique_checkbox_label = len(occurrences.get(normalized, [])) == 1
 
-        rectangle = match_input_candidate(field_candidates, label)
-        if rectangle is not None and not any(
+        rectangle = field_assignments.get(index)
+        if not label_is_in_table and rectangle is not None and not any(
             point_is_inside_bounds(rectangle["center"], table["bounds"])
             for table in table_regions
         ):
@@ -542,11 +728,8 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
                         "source": "ocr-page-classifier",
                     }
 
-        square = match_checkbox_candidate(square_candidates, label)
-        if square is not None and not any(
-            point_is_inside_bounds(square["center"], table["bounds"])
-            for table in table_regions
-        ):
+        square = square_assignments.get(index)
+        if square is not None:
             candidate = {
                 "id": f"checkbox-{len(candidates):04d}",
                 "kind": "checkbox",
@@ -557,7 +740,7 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
             }
             elements.append(candidate)
             resolved_text_ids.add(label_id)
-            if unique_label:
+            if unique_checkbox_label:
                 key = f"checkbox:{label.text}"
                 page_map["targets"][key] = list(square["center"])
                 page_map["targetDetails"][key] = {
@@ -598,6 +781,7 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
     page_map["elements"] = elements
     page_map["ambiguousTargets"] = ambiguous
     page_map["visualCandidates"] = candidates
+    page_map["weakCandidates"] = weak_candidates
     page_map["unclassified"] = [
         f"text-{index:04d}"
         for index in range(len(items))
@@ -613,6 +797,11 @@ def classify_visual_page(page_map: dict[str, Any]) -> None:
             ),
             "fieldCandidateCount": len(field_candidates),
             "squareCandidateCount": len(square_candidates),
+            "weakFieldCandidateCount": len(weak_field_candidates),
+            "weakSquareCandidateCount": len(weak_square_candidates),
+            "fieldAssignmentCount": len(field_assignments),
+            "squareAssignmentCount": len(square_assignments),
+            "associationStrategy": "global-one-to-one",
         }
     )
 
@@ -911,9 +1100,11 @@ def get_visual_page_map(
     persisted_regions = persisted.get("regions", [])
     persisted_relationships = persisted.get("relationships", [])
     persisted_candidates = persisted.get("visualCandidates", [])
+    persisted_weak_candidates = persisted.get("weakCandidates", [])
     persisted_unclassified = persisted.get("unclassified", [])
     persisted_performance = persisted.get("performance", {})
     persisted_raw_ocr = persisted.get("rawOcr", [])
+    persisted_raw_weak_ocr = persisted.get("rawWeakOcr", [])
     persisted_descriptor = persisted.get("structureDescriptor", {})
     persisted_classification_version = int(persisted.get("classificationVersion") or 0)
     change = None
@@ -947,9 +1138,11 @@ def get_visual_page_map(
         "regions": persisted_regions if isinstance(persisted_regions, list) else [],
         "relationships": persisted_relationships if isinstance(persisted_relationships, list) else [],
         "visualCandidates": persisted_candidates if isinstance(persisted_candidates, list) else [],
+        "weakCandidates": persisted_weak_candidates if isinstance(persisted_weak_candidates, list) else [],
         "unclassified": persisted_unclassified if isinstance(persisted_unclassified, list) else [],
         "performance": persisted_performance if isinstance(persisted_performance, dict) else {},
         "persistedRawOcr": persisted_raw_ocr if isinstance(persisted_raw_ocr, list) else [],
+        "persistedRawWeakOcr": persisted_raw_weak_ocr if isinstance(persisted_raw_weak_ocr, list) else [],
         "classificationVersion": persisted_classification_version,
     }
     maps[cache_key] = page_map
@@ -962,16 +1155,11 @@ def ensure_visual_ocr(
     window: Any,
     page_map: dict[str, Any],
 ) -> list[Any]:
-    items = page_map.get("ocrItems")
-    visual_image = page_map.get("visualImage")
-    if isinstance(items, list) and isinstance(visual_image, Image.Image):
-        return items
-
-    persisted_raw = page_map.get("persistedRawOcr")
-    reference_path = visual_reference_path(page_map["signature"])
-    if isinstance(persisted_raw, list) and persisted_raw and reference_path.is_file():
-        restored: list[Any] = []
-        for raw in persisted_raw:
+    def restore_ocr(raw_items: Any) -> list[Any]:
+        restored_items: list[Any] = []
+        if not isinstance(raw_items, list):
+            return restored_items
+        for raw in raw_items:
             if not isinstance(raw, dict):
                 continue
             bounds = raw.get("bounds")
@@ -981,7 +1169,7 @@ def ensure_visual_ocr(
                 and all(isinstance(value, int) for value in bounds)
             ):
                 continue
-            restored.append(
+            restored_items.append(
                 marker.OcrItem(
                     text=str(raw.get("text") or ""),
                     score=float(raw.get("score") or 0),
@@ -992,66 +1180,92 @@ def ensure_visual_ocr(
                     raw_text=str(raw.get("rawText") or ""),
                 )
             )
+        return restored_items
+
+    items = page_map.get("ocrItems")
+    visual_image = page_map.get("visualImage")
+    if isinstance(items, list) and isinstance(visual_image, Image.Image):
+        return items
+
+    persisted_raw = page_map.get("persistedRawOcr")
+    persisted_raw_weak = page_map.get("persistedRawWeakOcr")
+    reference_path = visual_reference_path(page_map["signature"])
+    if isinstance(persisted_raw, list) and persisted_raw and reference_path.is_file():
+        restored = restore_ocr(persisted_raw)
         if restored:
             with Image.open(reference_path) as reference:
-                page_map["visualImage"] = reference.convert("RGB")
-            page_map["ocrItems"] = restored
+                reference_image = reference.convert("RGB")
             if page_map.get("classificationVersion", 0) < VISUAL_CLASSIFICATION_VERSION:
-                classify_visual_page(page_map)
-                save_visual_targets(page_map)
-            return restored
+                # Older maps never retained low-confidence OCR output. Re-run
+                # OCR once against their saved reference so the new weak layer
+                # is genuinely complete instead of containing shapes only.
+                page_map["pendingImage"] = reference_image
+            else:
+                page_map["visualImage"] = reference_image
+                page_map["ocrItems"] = restored
+                page_map["weakOcrItems"] = restore_ocr(persisted_raw_weak)
+                return restored
 
-    screenshot_path = context.output_dir / (
-        f".visual_map_{context.state['timestamp']}_{time.time_ns()}.png"
+    pending = page_map.get("pendingImage")
+    visual_image = (
+        pending
+        if isinstance(pending, Image.Image)
+        else capture_visual_window(window)
     )
-    try:
-        pending = page_map.get("pendingImage")
-        visual_image = (
-            pending
-            if isinstance(pending, Image.Image)
-            else capture_visual_window(window)
+    ocr_bounds = page_map.get("ocrBounds")
+    if (
+        isinstance(ocr_bounds, list)
+        and len(ocr_bounds) == 4
+        and all(isinstance(value, int) for value in ocr_bounds)
+    ):
+        ocr_image = visual_image.crop(tuple(ocr_bounds))
+        offset_x, offset_y = ocr_bounds[0], ocr_bounds[1]
+    else:
+        ocr_image = visual_image
+        offset_x = offset_y = 0
+    engine = context.state.get("ocr_engine")
+    engine_init_seconds = 0.0
+    if engine is None:
+        engine_init_started = time.perf_counter()
+        engine = marker.create_ocr_engine()
+        context.state["ocr_engine"] = engine
+        engine_init_seconds = time.perf_counter() - engine_init_started
+    ocr_started = time.perf_counter()
+    detected_items = marker.run_ocr(
+        engine,
+        ocr_image,
+        min_score=marker.OCR_WEAK_MIN_SCORE,
+    )
+    ocr_seconds = time.perf_counter() - ocr_started
+    items = [
+        marker.OcrItem(
+            text=item.text,
+            score=item.score,
+            left=item.left + offset_x,
+            top=item.top + offset_y,
+            right=item.right + offset_x,
+            bottom=item.bottom + offset_y,
+            raw_text=item.raw_text,
         )
-        ocr_bounds = page_map.get("ocrBounds")
-        if (
-            isinstance(ocr_bounds, list)
-            and len(ocr_bounds) == 4
-            and all(isinstance(value, int) for value in ocr_bounds)
-        ):
-            ocr_image = visual_image.crop(tuple(ocr_bounds))
-            offset_x, offset_y = ocr_bounds[0], ocr_bounds[1]
-        else:
-            ocr_image = visual_image
-            offset_x = offset_y = 0
-        ocr_image.save(screenshot_path)
-        engine = context.state.get("ocr_engine")
-        engine_init_seconds = 0.0
-        if engine is None:
-            engine_init_started = time.perf_counter()
-            engine = marker.create_ocr_engine()
-            context.state["ocr_engine"] = engine
-            engine_init_seconds = time.perf_counter() - engine_init_started
-        ocr_started = time.perf_counter()
-        detected_items = marker.run_ocr(engine, screenshot_path)
-        ocr_seconds = time.perf_counter() - ocr_started
-        items = [
-            marker.OcrItem(
-                text=item.text,
-                score=item.score,
-                left=item.left + offset_x,
-                top=item.top + offset_y,
-                right=item.right + offset_x,
-                bottom=item.bottom + offset_y,
-                raw_text=item.raw_text,
-            )
-            for item in detected_items
-        ]
-    finally:
-        try:
-            screenshot_path.unlink()
-        except FileNotFoundError:
-            pass
+        for item in detected_items
+        if item.score >= marker.OCR_MIN_SCORE
+    ]
+    weak_ocr_items = [
+        marker.OcrItem(
+            text=item.text,
+            score=item.score,
+            left=item.left + offset_x,
+            top=item.top + offset_y,
+            right=item.right + offset_x,
+            bottom=item.bottom + offset_y,
+            raw_text=item.raw_text,
+        )
+        for item in detected_items
+        if item.score < marker.OCR_MIN_SCORE
+    ]
 
     page_map["ocrItems"] = items
+    page_map["weakOcrItems"] = weak_ocr_items
     page_map["visualImage"] = visual_image
     page_map["pendingImage"] = None
     regions_started = time.perf_counter()
@@ -1075,7 +1289,8 @@ def ensure_visual_ocr(
         "info",
         (
             f"已建立新的视觉状态地图并完成预分类：{len(items)} 段文字，"
-            f"{len(page_map.get('visualCandidates', []))} 个控件/表格候选；"
+            f"{len(page_map.get('visualCandidates', []))} 个强候选，"
+            f"{len(page_map.get('weakCandidates', []))} 个弱候选；"
             f"识别范围={'局部变化区域' if page_map.get('ocrBounds') else '完整窗口'}；"
             f"耗时 OCR={performance.get('ocrSeconds', 0):.2f}s，"
             f"候选检测与分类={performance.get('classificationSeconds', 0):.2f}s，"
@@ -1174,6 +1389,7 @@ def visual_bounds_overlap_table(
 def visual_toggle_anchor(
     page_map: dict[str, Any],
     state_texts: tuple[str, str],
+    context_text: str = "",
 ) -> tuple[list[int], list[int]] | None:
     """Find a previously mapped toggle label without starting another OCR run."""
 
@@ -1223,6 +1439,42 @@ def visual_toggle_anchor(
 
     if len(candidates) == 1:
         return next(iter(candidates.values()))
+    context_needle = marker.normalize_ocr_text(context_text)
+    if len(candidates) > 1 and context_needle:
+        context_points: list[list[int]] = []
+        context_items = list(page_map.get("persistedRawOcr") or [])
+        context_items.extend(page_map.get("ocrItems") or [])
+        for item in context_items:
+            if isinstance(item, dict):
+                text = marker.normalize_ocr_text(
+                    item.get("text") or item.get("rawText")
+                )
+                bounds = item.get("bounds")
+            else:
+                text = marker.normalize_ocr_text(getattr(item, "text", ""))
+                bounds = [
+                    getattr(item, "left", None),
+                    getattr(item, "top", None),
+                    getattr(item, "right", None),
+                    getattr(item, "bottom", None),
+                ]
+            if (
+                context_needle in text
+                and isinstance(bounds, list)
+                and len(bounds) == 4
+                and all(isinstance(value, int) for value in bounds)
+            ):
+                left, top, right, bottom = (int(value) for value in bounds)
+                context_points.append([(left + right) // 2, (top + bottom) // 2])
+        if len(context_points) == 1:
+            context_x, context_y = context_points[0]
+            return min(
+                candidates.values(),
+                key=lambda candidate: (
+                    (candidate[0][0] - context_x) ** 2
+                    + (candidate[0][1] - context_y) ** 2
+                ),
+            )
     return None
 
 
@@ -1234,31 +1486,126 @@ def local_visual_ocr(
     """Run OCR only inside one small window-relative rectangle."""
 
     left, top, right, bottom = bounds
-    temporary = context.output_dir / f".local_ocr_{time.time_ns()}.png"
-    try:
-        image.crop((left, top, right, bottom)).save(temporary)
-        engine = context.state.get("ocr_engine")
-        if engine is None:
-            engine = marker.create_ocr_engine()
-            context.state["ocr_engine"] = engine
-        detected = marker.run_ocr(engine, temporary)
-        return [
-            marker.OcrItem(
-                text=item.text,
-                score=item.score,
-                left=item.left + left,
-                top=item.top + top,
-                right=item.right + left,
-                bottom=item.bottom + top,
-                raw_text=item.raw_text,
-            )
-            for item in detected
+    engine = context.state.get("ocr_engine")
+    if engine is None:
+        engine = marker.create_ocr_engine()
+        context.state["ocr_engine"] = engine
+    detected = marker.run_ocr(
+        engine,
+        image.crop((left, top, right, bottom)),
+    )
+    return [
+        marker.OcrItem(
+            text=item.text,
+            score=item.score,
+            left=item.left + left,
+            top=item.top + top,
+            right=item.right + left,
+            bottom=item.bottom + top,
+            raw_text=item.raw_text,
+        )
+        for item in detected
+    ]
+
+
+def weak_text_matches(
+    page_map: dict[str, Any],
+    target: str,
+    *,
+    contains: bool = False,
+    foreground_bounds: list[int] | None = None,
+) -> list[Any]:
+    """Restore matching low-confidence OCR text without enabling it globally."""
+
+    matches: list[Any] = []
+    for candidate in page_map.get("weakCandidates") or []:
+        if (
+            not isinstance(candidate, dict)
+            or candidate.get("kind") != "text"
+            or candidate.get("source") != "low-confidence-ocr"
+        ):
+            continue
+        text = marker.normalize_ocr_text(
+            candidate.get("text") or candidate.get("rawText")
+        )
+        if not text or (target not in text if contains else text != target):
+            continue
+        bounds = candidate.get("bounds")
+        if not (
+            isinstance(bounds, list)
+            and len(bounds) == 4
+            and all(isinstance(value, int) for value in bounds)
+        ):
+            continue
+        center = [
+            (bounds[0] + bounds[2]) // 2,
+            (bounds[1] + bounds[3]) // 2,
         ]
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        if foreground_bounds is not None and not point_is_inside_bounds(
+            center,
+            foreground_bounds,
+        ):
+            continue
+        matches.append(
+            marker.OcrItem(
+                text=text,
+                score=float(candidate.get("confidence") or 0),
+                left=bounds[0],
+                top=bounds[1],
+                right=bounds[2],
+                bottom=bounds[3],
+                raw_text=str(candidate.get("rawText") or ""),
+            )
+        )
+    return matches
+
+
+def weak_control_match(
+    page_map: dict[str, Any],
+    labels: list[Any],
+    *,
+    kind: str,
+    matcher: Any,
+    foreground_bounds: list[int] | None,
+    table_bounds: list[list[int]],
+    exclude_tables: bool,
+) -> tuple[Any, dict[str, Any]] | None:
+    """Resolve one unambiguous weak control only after strong matching failed."""
+
+    controls = []
+    for candidate in page_map.get("weakCandidates") or []:
+        if not isinstance(candidate, dict) or candidate.get("kind") != kind:
+            continue
+        bounds = candidate.get("bounds")
+        center = candidate.get("center")
+        if not (
+            isinstance(bounds, list)
+            and len(bounds) == 4
+            and isinstance(center, list)
+            and len(center) == 2
+        ):
+            continue
+        if exclude_tables and visual_bounds_overlap_table(bounds, table_bounds):
+            continue
+        if foreground_bounds is not None and not point_is_inside_bounds(
+            center,
+            foreground_bounds,
+        ):
+            continue
+        controls.append(candidate)
+
+    scored: list[tuple[float, Any, dict[str, Any]]] = []
+    for label in labels:
+        for control in controls:
+            match = matcher([control], label)
+            if match is not None:
+                scored.append((float(match.get("score") or 0), label, match))
+    if not scored:
+        return None
+    scored.sort(key=lambda value: value[0], reverse=True)
+    if len(scored) > 1 and scored[0][0] - scored[1][0] < 6.0:
+        return None
+    return scored[0][1], scored[0][2]
 
 
 def toggle_state_match(items: list[Any], text: str) -> Any | None:
@@ -1267,6 +1614,61 @@ def toggle_state_match(items: list[Any], text: str) -> Any | None:
     target = marker.normalize_ocr_text(text)
     matches = [item for item in items if target and target in item.text]
     return max(matches, key=lambda item: (item.score, -item.top, -item.left)) if matches else None
+
+
+def choose_visual_text_match(
+    matches: list[Any],
+    anchor_local: tuple[int, int] | None = None,
+) -> Any | None:
+    """Choose duplicate visible text by operation context, not OCR score alone."""
+
+    if not matches:
+        return None
+    if anchor_local is None:
+        # With no operation context, reading order is more stable than tiny OCR
+        # confidence differences between identical labels.
+        return min(
+            matches,
+            key=lambda item: (item.top, item.left, len(item.text), -item.score),
+        )
+
+    anchor_x, anchor_y = anchor_local
+
+    def contextual_rank(item: Any) -> tuple[float, ...]:
+        center_x = (item.left + item.right) // 2
+        center_y = (item.top + item.bottom) // 2
+        height = max(1, item.bottom - item.top)
+        vertical_distance = abs(center_y - anchor_y)
+        horizontal_distance = abs(center_x - anchor_x)
+        same_operation_band = vertical_distance <= max(48, height * 3)
+        euclidean_distance = (
+            horizontal_distance * horizontal_distance
+            + vertical_distance * vertical_distance
+        ) ** 0.5
+        return (
+            0.0 if same_operation_band else 1.0,
+            float(vertical_distance),
+            euclidean_distance,
+            float(horizontal_distance),
+            float(item.top),
+            float(item.left),
+            float(-item.score),
+        )
+
+    return min(matches, key=contextual_rank)
+
+
+def remember_visual_action(
+    context: ExecutionContext,
+    point: tuple[int, int],
+    role: str,
+) -> None:
+    """Remember the last successful visual operation for duplicate disambiguation."""
+
+    context.state["last_visual_action"] = {
+        "screenPoint": [int(point[0]), int(point[1])],
+        "role": role,
+    }
 
 
 def visual_text_point(
@@ -1293,8 +1695,11 @@ def visual_text_point(
     )
     context.state["last_visual_resolved_map"] = page_map
     foreground_bounds = visual_foreground_bounds(page_map)
+    normalized_target = marker.normalize_ocr_text(target_name)
+    ambiguous_ids = page_map.get("ambiguousTargets", {}).get(normalized_target, [])
+    target_is_ambiguous = isinstance(ambiguous_ids, list) and len(ambiguous_ids) > 1
     cached = page_map["targets"].get(target_key)
-    if cached is not None and (
+    if cached is not None and not target_is_ambiguous and (
         foreground_bounds is None or point_is_inside_bounds(cached, foreground_bounds)
     ):
         return local_point_to_screen(window, cached)
@@ -1305,15 +1710,25 @@ def visual_text_point(
         page_map.get("targetDetails", {}).pop(target_key, None)
 
     items = ensure_visual_ocr(context, window, page_map)
-    target = marker.normalize_ocr_text(target_name)
+    target = normalized_target
     if not target:
         return None
     exact_matches = [item for item in items if item.text == target]
     matches = exact_matches
+    match_source = "ocr"
     if not matches and contains:
         matches = [item for item in items if target in item.text]
     if not matches:
-        return None
+        weak_matches = weak_text_matches(
+            page_map,
+            target,
+            contains=contains,
+            foreground_bounds=foreground_bounds,
+        )
+        if len(weak_matches) != 1:
+            return None
+        matches = weak_matches
+        match_source = "weak-ocr-local-fallback"
 
     if foreground_bounds is not None:
         foreground_matches = [
@@ -1328,25 +1743,45 @@ def visual_text_point(
             return None
         matches = foreground_matches
 
-    match = min(
+    anchor_local: tuple[int, int] | None = None
+    last_action = context.state.get("last_visual_action")
+    if isinstance(last_action, dict):
+        screen_point = last_action.get("screenPoint")
+        if (
+            isinstance(screen_point, list)
+            and len(screen_point) == 2
+            and all(isinstance(value, int) for value in screen_point)
+        ):
+            rect = window.rectangle()
+            local_x = screen_point[0] - rect.left
+            local_y = screen_point[1] - rect.top
+            if 0 <= local_x <= rect.width() and 0 <= local_y <= rect.height():
+                anchor_local = (local_x, local_y)
+
+    match = choose_visual_text_match(
         matches,
-        key=lambda item: (len(item.text), -item.score, item.top, item.left),
+        anchor_local=anchor_local if len(matches) > 1 else None,
     )
+    if match is None:
+        return None
     local_point = [
         (match.left + match.right) // 2,
         (match.top + match.bottom) // 2,
     ]
-    page_map["targets"][target_key] = local_point
-    page_map["targetDetails"][target_key] = {
-        "role": role,
-        "name": target_name,
-        "bounds": [match.left, match.top, match.right, match.bottom],
-        "clickPoint": local_point,
-        "matchMode": "contains" if contains else "exact",
-        "confidence": round(float(match.score), 5),
-        "source": "ocr",
-    }
-    save_visual_targets(page_map)
+    # A generic cached coordinate is unsafe for duplicate labels: another flow
+    # can reach the same page from a different region and need the other one.
+    if len(matches) == 1:
+        page_map["targets"][target_key] = local_point
+        page_map["targetDetails"][target_key] = {
+            "role": role,
+            "name": target_name,
+            "bounds": [match.left, match.top, match.right, match.bottom],
+            "clickPoint": local_point,
+            "matchMode": "contains" if contains else "exact",
+            "confidence": round(float(match.score), 5),
+            "source": match_source,
+        }
+        save_visual_targets(page_map)
     return local_point_to_screen(window, local_point)
 
 
@@ -1487,6 +1922,37 @@ def visual_input_point(
             )
         ]
     if not labels:
+        labels = weak_text_matches(
+            page_map,
+            target,
+            foreground_bounds=foreground_bounds,
+        )
+    weak_match = weak_control_match(
+        page_map,
+        labels,
+        kind="field-rectangle",
+        matcher=match_input_candidate,
+        foreground_bounds=foreground_bounds,
+        table_bounds=table_bounds,
+        exclude_tables=True,
+    )
+    if weak_match is not None:
+        label, rectangle = weak_match
+        local_point = [int(value) for value in rectangle["center"]]
+        page_map["targets"][target_key] = local_point
+        page_map["targetDetails"][target_key] = {
+            "role": "input",
+            "name": field_name,
+            "bounds": rectangle["bounds"],
+            "clickPoint": local_point,
+            "labelBounds": [label.left, label.top, label.right, label.bottom],
+            "relation": rectangle["relation"],
+            "confidence": rectangle["score"],
+            "source": "weak-candidate-local-fallback",
+        }
+        save_visual_targets(page_map)
+        return local_point_to_screen(window, local_point)
+    if not labels:
         return None
 
     visual_image = page_map.get("visualImage")
@@ -1545,11 +2011,21 @@ def visual_select_point(
         target_key=target_key,
     )
     foreground_bounds = visual_foreground_bounds(page_map)
+    table_bounds = visual_table_bounds(page_map)
     cached = page_map["targets"].get(target_key)
     if cached is not None:
         detail = page_map.get("targetDetails", {}).get(target_key, {})
+        cached_in_table = any(
+            point_is_inside_bounds(cached, table) for table in table_bounds
+        )
         if foreground_bounds is not None and not point_is_inside_bounds(
             cached, foreground_bounds
+        ):
+            page_map["targets"].pop(target_key, None)
+            page_map.get("targetDetails", {}).pop(target_key, None)
+        elif cached_in_table or visual_bounds_overlap_table(
+            detail.get("bounds") if isinstance(detail, dict) else cached,
+            table_bounds,
         ):
             page_map["targets"].pop(target_key, None)
             page_map.get("targetDetails", {}).pop(target_key, None)
@@ -1566,7 +2042,18 @@ def visual_select_point(
             page_map.get("targetDetails", {}).pop(target_key, None)
     items = ensure_visual_ocr(context, window, page_map)
     target = marker.normalize_ocr_text(field_name)
-    labels = [item for item in items if item.text == target]
+    labels = [
+        item
+        for item in items
+        if item.text == target
+        and not any(
+            point_is_inside_bounds(
+                [(item.left + item.right) // 2, (item.top + item.bottom) // 2],
+                table,
+            )
+            for table in table_bounds
+        )
+    ]
     if foreground_bounds is not None:
         labels = [
             item
@@ -1576,13 +2063,47 @@ def visual_select_point(
                 foreground_bounds,
             )
         ]
+    if not labels:
+        labels = weak_text_matches(
+            page_map,
+            target,
+            foreground_bounds=foreground_bounds,
+        )
+    weak_match = weak_control_match(
+        page_map,
+        labels,
+        kind="field-rectangle",
+        matcher=match_input_candidate,
+        foreground_bounds=foreground_bounds,
+        table_bounds=table_bounds,
+        exclude_tables=True,
+    )
+    if weak_match is not None:
+        label, rectangle = weak_match
+        local_point = [int(value) for value in rectangle["center"]]
+        page_map["targets"][target_key] = local_point
+        page_map["targetDetails"][target_key] = {
+            "role": "select",
+            "name": field_name,
+            "bounds": rectangle["bounds"],
+            "clickPoint": local_point,
+            "labelBounds": [label.left, label.top, label.right, label.bottom],
+            "relation": rectangle["relation"],
+            "confidence": rectangle["score"],
+            "source": "weak-candidate-local-fallback",
+        }
+        save_visual_targets(page_map)
+        return local_point_to_screen(window, local_point)
     visual_image = page_map.get("visualImage")
     if not labels or not isinstance(visual_image, Image.Image):
         return None
     detected: list[tuple[Any, dict[str, Any]]] = []
     for label in labels:
         rectangle = find_input_rectangle(visual_image, label)
-        if rectangle is not None:
+        if rectangle is not None and not visual_bounds_overlap_table(
+            rectangle.get("bounds"),
+            table_bounds,
+        ):
             detected.append((label, rectangle))
     if not detected:
         return None
@@ -1622,6 +2143,7 @@ def visual_checkbox_point(
         target_key=target_key,
     )
     foreground_bounds = visual_foreground_bounds(page_map)
+    table_bounds = visual_table_bounds(page_map)
     cached = page_map["targets"].get(target_key)
     if cached is not None:
         detail = page_map.get("targetDetails", {}).get(target_key, {})
@@ -1641,6 +2163,42 @@ def visual_checkbox_point(
 
     items = ensure_visual_ocr(context, window, page_map)
     target = marker.normalize_ocr_text(checkbox_name)
+    classified = [
+        element
+        for element in page_map.get("elements") or []
+        if isinstance(element, dict)
+        and element.get("kind") == "checkbox"
+        and marker.normalize_ocr_text(element.get("labelText")) == target
+        and isinstance(element.get("center"), list)
+        and len(element["center"]) == 2
+        and (
+            foreground_bounds is None
+            or point_is_inside_bounds(element["center"], foreground_bounds)
+        )
+    ]
+    if len(classified) == 1:
+        square = classified[0]
+        local_point = [int(value) for value in square["center"]]
+        label_by_id = {
+            str(element.get("id")): element
+            for element in page_map.get("elements") or []
+            if isinstance(element, dict) and element.get("id")
+        }
+        label = label_by_id.get(str(square.get("labelId") or ""), {})
+        page_map["targets"][target_key] = local_point
+        page_map["targetDetails"][target_key] = {
+            "role": "checkbox",
+            "name": checkbox_name,
+            "bounds": square.get("bounds"),
+            "clickPoint": local_point,
+            "labelBounds": label.get("bounds"),
+            "relation": square.get("relation"),
+            "confidence": square.get("score"),
+            "source": "ocr-page-classifier",
+            "locatorVersion": VISUAL_CHECKBOX_LOCATOR_VERSION,
+        }
+        save_visual_targets(page_map)
+        return local_point_to_screen(window, local_point)
     labels = [item for item in items if item.text == target]
     if foreground_bounds is not None:
         labels = [
@@ -1651,6 +2209,38 @@ def visual_checkbox_point(
                 foreground_bounds,
             )
         ]
+    if not labels:
+        labels = weak_text_matches(
+            page_map,
+            target,
+            foreground_bounds=foreground_bounds,
+        )
+    weak_match = weak_control_match(
+        page_map,
+        labels,
+        kind="square-control",
+        matcher=match_checkbox_candidate,
+        foreground_bounds=foreground_bounds,
+        table_bounds=table_bounds,
+        exclude_tables=False,
+    )
+    if weak_match is not None:
+        label, square = weak_match
+        local_point = [int(value) for value in square["center"]]
+        page_map["targets"][target_key] = local_point
+        page_map["targetDetails"][target_key] = {
+            "role": "checkbox",
+            "name": checkbox_name,
+            "bounds": square["bounds"],
+            "clickPoint": local_point,
+            "labelBounds": [label.left, label.top, label.right, label.bottom],
+            "relation": square["relation"],
+            "confidence": square["score"],
+            "source": "weak-candidate-local-fallback",
+            "locatorVersion": VISUAL_CHECKBOX_LOCATOR_VERSION,
+        }
+        save_visual_targets(page_map)
+        return local_point_to_screen(window, local_point)
     if not labels:
         return None
 
@@ -1748,6 +2338,7 @@ def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> di
     time.sleep(0.2)
     if submit:
         send_keys("{ENTER}", pause=0.08)
+    remember_visual_action(context, point, "input")
     context.emit(
         "info",
         f"已填写字段“{field_name}”{('并按回车' if submit else '')}；定位方式={locator_mode}",
@@ -1831,6 +2422,7 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
         )
     mouse.click(button="left", coords=option_point)
     locator_mode = "visual-map"
+    remember_visual_action(context, point, "select")
 
     context.emit(
         "info",
@@ -1888,6 +2480,7 @@ def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> d
     if should_click:
         mouse.click(button="left", coords=point)
     final_state = not current_state if should_click else current_state
+    remember_visual_action(context, point, "checkbox")
     context.emit(
         "info",
         f"勾选框“{checkbox_name}”已设为{('勾选' if final_state else '未勾选')}；定位方式={locator_mode}",
@@ -1941,6 +2534,7 @@ def run_his_click_object(context: ExecutionContext, params: dict[str, Any]) -> d
         )
     mouse.click(button="left", coords=point)
     locator_mode = "visual-map"
+    remember_visual_action(context, point, "click-object")
     resolved_map = context.state.get("last_visual_resolved_map")
     if isinstance(resolved_map, dict) and resolved_map.get("parentSignature"):
         signatures = [
@@ -2004,6 +2598,7 @@ def run_his_input_number(context: ExecutionContext, params: dict[str, Any]) -> d
         )
     mouse.click(button="left", coords=point)
     locator_mode = "visual-map"
+    remember_visual_action(context, point, "input")
     time.sleep(0.15)
     send_keys("^a", pause=0.06)
     send_keys("{BACKSPACE}", pause=0.06)
@@ -2236,6 +2831,7 @@ def run_visual_click_table_row(
     local_point = [click_x, row_y]
     screen_point = local_point_to_screen(window, local_point)
     mouse.click(button="left", coords=screen_point)
+    remember_visual_action(context, screen_point, "table-row")
     context.emit(
         "info",
         (
@@ -3224,6 +3820,7 @@ def run_visual_map_page(
         "textCount": len(items),
         "elementCount": len(page_map.get("elements", [])),
         "controlCandidateCount": len(page_map.get("visualCandidates", [])),
+        "weakCandidateCount": len(page_map.get("weakCandidates", [])),
         "reusableTargetCount": len(page_map.get("targets", {})),
         "ambiguousTargetCount": len(page_map.get("ambiguousTargets", {})),
         "unclassifiedCount": len(page_map.get("unclassified", [])),
@@ -3415,6 +4012,7 @@ def run_his_input_date(context: ExecutionContext, params: dict[str, Any]) -> dic
         send_keys("{TAB}", pause=0.08)
     elif confirm_key == "Enter":
         send_keys("{ENTER}", pause=0.08)
+    remember_visual_action(context, segment_points[0], "date-input")
 
     context.emit(
         "info",
@@ -3442,25 +4040,32 @@ def run_his_input_date(context: ExecutionContext, params: dict[str, Any]) -> dic
     }
 
 
-def run_visual_ensure_expanded(
+def run_visual_set_expand_state(
     context: ExecutionContext,
     params: dict[str, Any],
 ) -> dict[str, Any]:
-    """Use small-area OCR to make a mapped expand/collapse toggle idempotent."""
+    """Set one mapped expand/collapse control to the requested visual state."""
 
     collapsed_text = str(params.get("collapsedText") or "").strip()
     expanded_text = str(params.get("expandedText") or "").strip()
+    target_state = str(params.get("targetState") or "展开").strip()
+    context_text = str(params.get("contextText") or "").strip()
     horizontal_padding = int(params.get("horizontalPadding", 100))
     vertical_padding = int(params.get("verticalPadding", 40))
     wait_after_click = float(params.get("waitAfterClickSeconds", 0.3))
+    verification_attempts = int(params.get("verificationAttempts", 3))
     if not collapsed_text or not expanded_text:
         raise WorkflowExecutionError("折叠状态文字和展开状态文字不能为空")
     if marker.normalize_ocr_text(collapsed_text) == marker.normalize_ocr_text(expanded_text):
         raise WorkflowExecutionError("折叠状态文字和展开状态文字不能相同")
+    if target_state not in {"展开", "收起"}:
+        raise WorkflowExecutionError("目标展开状态无效")
     if not 10 <= horizontal_padding <= 500 or not 10 <= vertical_padding <= 300:
         raise WorkflowExecutionError("局部 OCR 范围参数无效")
     if not 0 <= wait_after_click <= 10:
         raise WorkflowExecutionError("点击后等待时间必须在 0～10 秒之间")
+    if not 1 <= verification_attempts <= 5:
+        raise WorkflowExecutionError("状态验证次数必须在 1～5 次之间")
 
     window = current_window(context)
     page = visual_page_id(params)
@@ -3481,6 +4086,7 @@ def run_visual_ensure_expanded(
         anchor = visual_toggle_anchor(
             candidate,
             (collapsed_text, expanded_text),
+            context_text=context_text,
         )
         if anchor is None:
             continue
@@ -3493,6 +4099,8 @@ def run_visual_ensure_expanded(
             "已有页面 Map 中未找到展开/收起状态文字，无法确定局部 OCR 区域；请先建立当前页面布局"
         )
 
+    desired_text = expanded_text if target_state == "展开" else collapsed_text
+    source_text = collapsed_text if target_state == "展开" else expanded_text
     snapshot = capture_visual_window(window)
     for _anchor_point, anchor_bounds in anchors[:8]:
         left = max(0, anchor_bounds[0] - horizontal_padding)
@@ -3502,54 +4110,101 @@ def run_visual_ensure_expanded(
         bounds = [left, top, right, bottom]
         items = local_visual_ocr(context, snapshot, bounds)
         expanded_match = toggle_state_match(items, expanded_text)
-        if expanded_match is not None:
+        collapsed_match = toggle_state_match(items, collapsed_text)
+        current_state = (
+            "展开"
+            if expanded_match is not None
+            else "收起" if collapsed_match is not None else ""
+        )
+        current_match = expanded_match or collapsed_match
+
+        if current_state == target_state and current_match is not None:
             point = [
-                (expanded_match.left + expanded_match.right) // 2,
-                (expanded_match.top + expanded_match.bottom) // 2,
+                (current_match.left + current_match.right) // 2,
+                (current_match.top + current_match.bottom) // 2,
             ]
+            remember_visual_action(
+                context,
+                local_point_to_screen(window, point),
+                "set-expand-state",
+            )
             context.emit(
                 "info",
-                f"局部 OCR 检测到“{expanded_text}”，区域已经展开，本次不点击",
+                f"局部 OCR 检测到“{current_match.text}”，区域已经{target_state}，本次不点击",
                 None,
             )
             return {
-                "state": "expanded",
+                "state": target_state,
                 "clicked": False,
-                "matchedText": expanded_match.text,
+                "verified": True,
+                "matchedText": current_match.text,
                 "point": point,
                 "ocrBounds": bounds,
                 "recognitionScope": "local",
             }
 
-        collapsed_match = toggle_state_match(items, collapsed_text)
-        if collapsed_match is not None:
+        if current_match is not None:
             local_point = [
-                (collapsed_match.left + collapsed_match.right) // 2,
-                (collapsed_match.top + collapsed_match.bottom) // 2,
+                (current_match.left + current_match.right) // 2,
+                (current_match.top + current_match.bottom) // 2,
             ]
-            mouse.click(
-                button="left",
-                coords=local_point_to_screen(window, local_point),
+            screen_point = local_point_to_screen(window, local_point)
+            mouse.click(button="left", coords=screen_point)
+            remember_visual_action(context, screen_point, "set-expand-state")
+
+            last_source_match = None
+            for _attempt in range(verification_attempts):
+                if wait_after_click:
+                    context.wait(wait_after_click)
+                verification_snapshot = capture_visual_window(window)
+                verification_items = local_visual_ocr(
+                    context,
+                    verification_snapshot,
+                    bounds,
+                )
+                desired_match = toggle_state_match(verification_items, desired_text)
+                if desired_match is not None:
+                    context.emit(
+                        "info",
+                        f"局部 OCR 已确认区域切换为{target_state}状态",
+                        None,
+                    )
+                    return {
+                        "state": target_state,
+                        "clicked": True,
+                        "verified": True,
+                        "matchedText": desired_match.text,
+                        "point": local_point,
+                        "ocrBounds": bounds,
+                        "recognitionScope": "local",
+                    }
+                last_source_match = toggle_state_match(
+                    verification_items,
+                    source_text,
+                )
+
+            if last_source_match is not None:
+                raise WorkflowExecutionError(
+                    f"已点击状态文字，但局部 OCR 仍检测到“{source_text}”，未确认切换为{target_state}状态"
+                )
+            raise WorkflowExecutionError(
+                f"已点击状态文字，但局部 OCR 未识别到“{desired_text}”，无法确认区域已经{target_state}"
             )
-            if wait_after_click:
-                context.wait(wait_after_click)
-            context.emit(
-                "info",
-                f"局部 OCR 检测到“{collapsed_text}”，已点击并展开",
-                None,
-            )
-            return {
-                "state": "collapsed",
-                "clicked": True,
-                "matchedText": collapsed_match.text,
-                "point": local_point,
-                "ocrBounds": bounds,
-                "recognitionScope": "local",
-            }
 
     raise WorkflowExecutionError(
         f"局部 OCR 未识别到“{collapsed_text}”或“{expanded_text}”，未执行点击"
     )
+
+
+def run_visual_ensure_expanded(
+    context: ExecutionContext,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Keep existing workflows compatible with the earlier one-way module."""
+
+    compatible_params = dict(params)
+    compatible_params["targetState"] = "展开"
+    return run_visual_set_expand_state(context, compatible_params)
 
 
 def run_visual_hover_object(
@@ -3686,6 +4341,67 @@ def build_registry() -> WorkflowRegistry:
                 field("hoverWaitSeconds", "悬浮后等待（秒）", "number", 0.5, min=0, max=10, step=0.1),
             ),
             run_visual_hover_object,
+        ),
+        ModuleDefinition(
+            "visual.set_expand_state",
+            "设置展开状态（局部 OCR）",
+            "视觉",
+            "通过小范围 OCR 判断当前状态，只在需要时点击，并在点击后确认已经切换到目标状态。",
+            (
+                field(
+                    "targetState",
+                    "目标状态",
+                    "select",
+                    "展开",
+                    options=["展开", "收起"],
+                ),
+                field("collapsedText", "折叠时显示文字", "text", "更多"),
+                field("expandedText", "展开时显示文字", "text", "收起"),
+                field(
+                    "contextText",
+                    "附近固定文字（可选）",
+                    "text",
+                    "",
+                ),
+                visual_page_field(),
+                field(
+                    "horizontalPadding",
+                    "左右识别范围（像素）",
+                    "number",
+                    100,
+                    min=10,
+                    max=500,
+                    step=10,
+                ),
+                field(
+                    "verticalPadding",
+                    "上下识别范围（像素）",
+                    "number",
+                    40,
+                    min=10,
+                    max=300,
+                    step=10,
+                ),
+                field(
+                    "waitAfterClickSeconds",
+                    "每次状态验证前等待（秒）",
+                    "number",
+                    0.3,
+                    min=0,
+                    max=10,
+                    step=0.1,
+                ),
+                field(
+                    "verificationAttempts",
+                    "状态验证次数",
+                    "number",
+                    3,
+                    min=1,
+                    max=5,
+                    step=1,
+                ),
+            ),
+            run_visual_set_expand_state,
         ),
         ModuleDefinition(
             "visual.ensure_expanded",

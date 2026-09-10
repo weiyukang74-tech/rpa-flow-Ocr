@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import re
+import sys
 import threading
 import uuid
 import webbrowser
@@ -25,7 +26,11 @@ from workflow_engine import (
 )
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
 WEB_ROOT = ROOT / "web"
 CONFIG_ROOT = ROOT / "configs"
 DEFAULT_CONFIG_PATH = CONFIG_ROOT / "default.json"

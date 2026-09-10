@@ -22,6 +22,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+import numpy as np
 from PIL import Image, ImageDraw
 
 import his_automation as base
@@ -39,6 +40,7 @@ TARGET_HEADERS: tuple[str, ...] = (
 MARK_COLOR = (235, 32, 32)
 MARK_WIDTH = 4
 OCR_MIN_SCORE = 0.45
+OCR_WEAK_MIN_SCORE = 0.20
 
 
 @dataclass(frozen=True)
@@ -107,7 +109,17 @@ def create_ocr_engine() -> Any:
         ) from exc
 
     # 默认配置已经包含中英文检测和识别模型。
-    return RapidOCR()
+    try:
+        return RapidOCR(
+            params={
+                "Global.text_score": OCR_WEAK_MIN_SCORE,
+                "Global.use_cls": False,
+            }
+        )
+    except (TypeError, ValueError):
+        # Older compatible releases may not accept the structured parameter
+        # dictionary; call-time filtering in run_ocr remains available.
+        return RapidOCR()
 
 
 def normalize_ocr_text(text: object) -> str:
@@ -128,7 +140,11 @@ def box_to_rect(box: Any, scale: float = 1.0) -> tuple[int, int, int, int]:
     )
 
 
-def parse_ocr_result(result: Any, scale: float) -> list[OcrItem]:
+def parse_ocr_result(
+    result: Any,
+    scale: float,
+    min_score: float = OCR_MIN_SCORE,
+) -> list[OcrItem]:
     """兼容 RapidOCR 新版对象返回值及旧版列表返回值。"""
 
     items: list[OcrItem] = []
@@ -151,7 +167,7 @@ def parse_ocr_result(result: Any, scale: float) -> list[OcrItem]:
     for box, text, score in rows:
         clean = normalize_ocr_text(text)
         confidence = float(score)
-        if not clean or confidence < OCR_MIN_SCORE:
+        if not clean or confidence < min_score:
             continue
         left, top, right, bottom = box_to_rect(box, scale)
         if right <= left or bottom <= top:
@@ -170,28 +186,47 @@ def parse_ocr_result(result: Any, scale: float) -> list[OcrItem]:
     return items
 
 
-def run_ocr(engine: Any, image_path: Path) -> list[OcrItem]:
-    """放大截图后 OCR，最后把坐标换算回原图尺寸。"""
+def run_ocr(
+    engine: Any,
+    image_source: Path | Image.Image | np.ndarray,
+    min_score: float = OCR_MIN_SCORE,
+    use_cls: bool = False,
+) -> list[OcrItem]:
+    """Run OCR in memory with an adaptive scale for desktop UI text."""
 
-    scale = 2.0
-    with Image.open(image_path) as source:
-        image = source.convert("RGB")
+    if isinstance(image_source, np.ndarray):
+        image = Image.fromarray(image_source).convert("RGB")
+    elif isinstance(image_source, Image.Image):
+        image = image_source.convert("RGB")
+    else:
+        with Image.open(image_source) as source:
+            image = source.convert("RGB")
+
+    # RapidOCR itself limits oversized inputs. Targeting a roughly 2K long
+    # edge avoids enlarging a 1920px desktop to 4K only to shrink it again,
+    # while smaller windows still receive enough magnification for tiny text.
+    longest_side = max(1, image.width, image.height)
+    scale = min(2.0, max(1.0, 2000.0 / longest_side))
+    if scale > 1.02:
         enlarged = image.resize(
             (round(image.width * scale), round(image.height * scale)),
             Image.Resampling.LANCZOS,
         )
-
-    # RapidOCR 支持 PIL/ndarray 的版本不完全一致；临时文件方式兼容性最高。
-    temporary_path = image_path.with_name(f".{image_path.stem}_ocr_input.png")
-    enlarged.save(temporary_path)
+    else:
+        enlarged = image
+        scale = 1.0
+    input_array = np.asarray(enlarged)
     try:
-        result = engine(str(temporary_path))
-    finally:
-        try:
-            temporary_path.unlink()
-        except FileNotFoundError:
-            pass
-    return parse_ocr_result(result, scale)
+        result = engine(
+            input_array,
+            text_score=min_score,
+            use_cls=use_cls,
+        )
+    except TypeError:
+        # Compatibility with older RapidOCR releases that accept ndarray input
+        # but do not expose call-time thresholds.
+        result = engine(input_array)
+    return parse_ocr_result(result, scale, min_score)
 
 
 def locate_table_title(

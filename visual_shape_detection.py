@@ -83,7 +83,36 @@ def _deduplicate_rectangles(candidates: list[dict[str, Any]]) -> list[dict[str, 
     return sorted(selected, key=lambda item: (item["bounds"][1], item["bounds"][0]))
 
 
-def detect_visual_control_candidates(image: Image.Image) -> dict[str, list[dict[str, Any]]]:
+def _without_strong_duplicates(
+    candidates: list[dict[str, Any]],
+    strong_candidates: list[dict[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Keep a bounded weak pool without duplicating accepted controls."""
+
+    filtered = []
+    for candidate in _deduplicate_rectangles(candidates):
+        bounds = candidate["bounds"]
+        center_x, center_y = candidate["center"]
+        if any(
+            _intersection_over_union(bounds, strong["bounds"]) >= 0.60
+            or (
+                abs(center_x - strong["center"][0]) <= 4
+                and abs(center_y - strong["center"][1]) <= 4
+            )
+            for strong in strong_candidates
+        ):
+            continue
+        filtered.append(candidate)
+    selected = sorted(filtered, key=lambda item: item["score"], reverse=True)[:limit]
+    return sorted(selected, key=lambda item: (item["bounds"][1], item["bounds"][0]))
+
+
+def detect_visual_control_candidates(
+    image: Image.Image,
+    dpi_scale: float = 1.0,
+) -> dict[str, list[dict[str, Any]]]:
     """Extract field-like rectangles and small square controls in one pass.
 
     Contours are calculated once for the entire screenshot. Later classification
@@ -93,39 +122,82 @@ def detect_visual_control_candidates(image: Image.Image) -> dict[str, list[dict[
 
     rgb = np.asarray(image.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    ui_scale = min(3.0, max(0.75, float(dpi_scale or 1.0)))
+
+    # Keep the conservative edge map for strong candidates. A second adaptive
+    # map reveals faint or unevenly painted legacy controls and contributes only
+    # to the weak pool unless the conservative evidence is also sufficient.
     edges = cv2.Canny(gray, 22, 72)
+    adaptive_block = max(15, round(31 * ui_scale))
+    if adaptive_block % 2 == 0:
+        adaptive_block += 1
+    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+    adaptive = cv2.adaptiveThreshold(
+        blurred,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        adaptive_block,
+        7,
+    )
+    adaptive_edges = cv2.morphologyEx(
+        adaptive,
+        cv2.MORPH_GRADIENT,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+    )
+    weak_edges = cv2.bitwise_or(edges, adaptive_edges)
     closed = cv2.morphologyEx(
-        edges,
+        weak_edges,
         cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
     )
     contours, _ = cv2.findContours(closed, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     fields: list[dict[str, Any]] = []
     squares: list[dict[str, Any]] = []
+    weak_fields: list[dict[str, Any]] = []
+    weak_squares: list[dict[str, Any]] = []
     image_area = max(1, image.width * image.height)
 
     for contour in contours:
         x, y, width, height = cv2.boundingRect(contour)
-        if width < 8 or height < 8 or width * height > image_area * 0.30:
+        if width < 6 or height < 6 or width * height > image_area * 0.30:
             continue
         right, bottom = x + width - 1, y + height - 1
         bounds = [int(x), int(y), int(right), int(bottom)]
         minimum_border, average_border = _border_coverage(edges, bounds)
+        weak_minimum_border, weak_average_border = _border_coverage(
+            weak_edges,
+            bounds,
+        )
         contour_area = float(abs(cv2.contourArea(contour)))
         rectangularity = contour_area / max(1.0, float(width * height))
         perimeter = cv2.arcLength(contour, True)
         polygon = cv2.approxPolyDP(contour, 0.025 * perimeter, True)
         center = [int(x + width // 2), int(y + height // 2)]
 
-        if (
-            45 <= width <= min(900, round(image.width * 0.75))
-            and 18 <= height <= 120
+        strong_field_shape = (
+            round(45 * ui_scale)
+            <= width
+            <= min(round(900 * ui_scale), round(image.width * 0.75))
+            and round(18 * ui_scale) <= height <= round(120 * ui_scale)
             and width / max(1, height) >= 1.45
             and minimum_border >= 0.10
             and average_border >= 0.20
             and rectangularity >= 0.42
             and 4 <= len(polygon) <= 12
-        ):
+        )
+        weak_field_shape = (
+            round(28 * ui_scale)
+            <= width
+            <= min(round(1100 * ui_scale), round(image.width * 0.85))
+            and round(14 * ui_scale) <= height <= round(145 * ui_scale)
+            and width / max(1, height) >= 1.20
+            and weak_minimum_border >= 0.04
+            and weak_average_border >= 0.11
+            and rectangularity >= 0.18
+            and 3 <= len(polygon) <= 20
+        )
+        if strong_field_shape or weak_field_shape:
             inset = max(2, min(6, height // 5))
             interior = rgb[
                 min(image.height, y + inset) : max(
@@ -138,46 +210,140 @@ def detect_visual_control_candidates(image: Image.Image) -> dict[str, list[dict[
                 ),
             ]
             interior_luminance = float(interior.mean()) if interior.size else 0.0
-            if interior_luminance >= 175:
-                score = (
-                    average_border * 75
-                    + minimum_border * 35
-                    + min(1.0, rectangularity) * 20
-                    + max(0.0, 1.0 - abs(height - 34) / 80) * 10
-                )
-                fields.append(
+            candidate_minimum_border = (
+                minimum_border if strong_field_shape else weak_minimum_border
+            )
+            candidate_average_border = (
+                average_border if strong_field_shape else weak_average_border
+            )
+            score = (
+                candidate_average_border * 75
+                + candidate_minimum_border * 35
+                + min(1.0, rectangularity) * 20
+                + max(0.0, 1.0 - abs(height - 34) / 80) * 10
+            )
+            field_candidate = {
+                "bounds": bounds,
+                "center": center,
+                "score": round(score, 3),
+                "source": "global-contour",
+            }
+            if strong_field_shape and interior_luminance >= 175:
+                fields.append(field_candidate)
+            elif weak_field_shape and interior_luminance >= 135:
+                weak_fields.append(
                     {
-                        "bounds": bounds,
-                        "center": center,
-                        "score": round(score, 3),
-                        "source": "global-contour",
+                        **field_candidate,
+                        "source": "global-contour-weak",
+                        "confidenceLevel": "weak",
+                        "weakReasons": [
+                            reason
+                            for reason, failed in (
+                                (
+                                    "nonstandard-size",
+                                    not (
+                                        45
+                                        <= width
+                                        <= min(900, round(image.width * 0.75))
+                                        and 18 <= height <= 120
+                                    ),
+                                ),
+                                (
+                                    "nonstandard-aspect",
+                                    width / max(1, height) < 1.45,
+                                ),
+                                (
+                                    "low-border-coverage",
+                                    minimum_border < 0.10
+                                    or average_border < 0.20,
+                                ),
+                                ("low-rectangularity", rectangularity < 0.42),
+                                (
+                                    "nonstandard-contour",
+                                    not (4 <= len(polygon) <= 12),
+                                ),
+                                ("dark-interior", interior_luminance < 175),
+                            )
+                            if failed
+                        ],
                     }
                 )
 
         aspect = width / max(1, height)
-        if (
-            8 <= width <= 48
-            and 8 <= height <= 48
+        strong_square_shape = (
+            round(8 * ui_scale) <= width <= round(48 * ui_scale)
+            and round(8 * ui_scale) <= height <= round(48 * ui_scale)
             and 0.65 <= aspect <= 1.45
             and minimum_border >= 0.10
             and average_border >= 0.20
             and rectangularity >= 0.25
             and 4 <= len(polygon) <= 16
-        ):
+        )
+        weak_square_shape = (
+            round(6 * ui_scale) <= width <= round(56 * ui_scale)
+            and round(6 * ui_scale) <= height <= round(56 * ui_scale)
+            and 0.50 <= aspect <= 1.80
+            and weak_minimum_border >= 0.04
+            and weak_average_border >= 0.11
+            and rectangularity >= 0.16
+            and 3 <= len(polygon) <= 24
+        )
+        if strong_square_shape or weak_square_shape:
+            candidate_minimum_border = (
+                minimum_border if strong_square_shape else weak_minimum_border
+            )
+            candidate_average_border = (
+                average_border if strong_square_shape else weak_average_border
+            )
             score = (
-                average_border * 80
-                + minimum_border * 40
+                candidate_average_border * 80
+                + candidate_minimum_border * 40
                 + min(1.0, rectangularity) * 20
                 + max(0.0, 1.0 - abs(width - height) / max(width, height)) * 15
             )
-            squares.append(
-                {
-                    "bounds": bounds,
-                    "center": center,
-                    "score": round(score, 3),
-                    "source": "global-contour",
-                }
-            )
+            square_candidate = {
+                "bounds": bounds,
+                "center": center,
+                "score": round(score, 3),
+                "source": "global-contour",
+            }
+            if strong_square_shape:
+                squares.append(square_candidate)
+            else:
+                weak_squares.append(
+                    {
+                        **square_candidate,
+                        "source": "global-contour-weak",
+                        "confidenceLevel": "weak",
+                        "weakReasons": [
+                            reason
+                            for reason, failed in (
+                                (
+                                    "nonstandard-size",
+                                    not (
+                                        8 <= width <= 48
+                                        and 8 <= height <= 48
+                                    ),
+                                ),
+                                (
+                                    "non-square-aspect",
+                                    not (0.65 <= aspect <= 1.45),
+                                ),
+                                (
+                                    "low-border-coverage",
+                                    minimum_border < 0.10
+                                    or average_border < 0.20,
+                                ),
+                                ("low-rectangularity", rectangularity < 0.25),
+                                (
+                                    "nonstandard-contour",
+                                    not (4 <= len(polygon) <= 16),
+                                ),
+                            )
+                            if failed
+                        ],
+                    }
+                )
 
     fields = _deduplicate_rectangles(fields)
     squares = _deduplicate_rectangles(squares)
@@ -193,12 +359,29 @@ def detect_visual_control_candidates(image: Image.Image) -> dict[str, list[dict[
             and field["bounds"][1] - 2 <= center_y <= field["bounds"][3] + 2
             for field in fields
         ):
+            weak_squares.append(
+                {
+                    **square,
+                    "source": "global-contour-weak",
+                    "confidenceLevel": "weak",
+                    "weakReasons": ["inside-field"],
+                }
+            )
             continue
         independent_squares.append(square)
+
+    weak_fields = _without_strong_duplicates(weak_fields, fields, limit=300)
+    weak_squares = _without_strong_duplicates(
+        weak_squares,
+        independent_squares,
+        limit=300,
+    )
 
     return {
         "fieldRectangles": fields,
         "squareControls": independent_squares,
+        "weakFieldRectangles": weak_fields,
+        "weakSquareControls": weak_squares,
     }
 
 
@@ -401,41 +584,42 @@ def detect_table_regions(image: Image.Image) -> list[dict[str, Any]]:
     """
 
     rgb = image.convert("RGB")
-    pixels = rgb.load()
-    minimum_span = max(60, round(rgb.height * 0.065))
+    rgb_array = np.asarray(rgb, dtype=np.int16)
+    horizontal_edge_mask = np.zeros((rgb.height, rgb.width), dtype=np.uint8)
+    horizontal_edge_mask[1:, :] = (
+        np.abs(rgb_array[1:, :, :] - rgb_array[:-1, :, :]).sum(axis=2) >= 18
+    ).astype(np.uint8)
+    # Result tables may contain only one data row. Their vertical separators
+    # are still repeated across many columns, but are much shorter than a large
+    # scrolling grid, so do not require a 6.5% window-height span.
+    minimum_span = max(42, round(rgb.height * 0.035))
     raw_lines: list[tuple[int, int, int]] = []
+
+    # Calculate all adjacent-column colour differences in native code. The old
+    # implementation called getpixel for every x/y pair, which dominated page
+    # classification time on 1080p windows.
+    colour_delta = np.abs(rgb_array[:, 1:, :] - rgb_array[:, :-1, :]).sum(axis=2)
+    edge_mask = np.zeros((rgb.height, rgb.width), dtype=np.uint8)
+    edge_mask[:, 1:] = (colour_delta >= 18).astype(np.uint8)
+    bridged = cv2.morphologyEx(
+        edge_mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)),
+    )
 
     for x in range(1, rgb.width):
         best: tuple[int, int] | None = None
-        start: int | None = None
-        last_edge: int | None = None
-        edge_count = 0
-        for y in range(rgb.height):
-            edge = pixel_distance(pixels[x, y], pixels[x - 1, y]) >= 18
-            if edge:
-                if start is None:
-                    start = y
-                    edge_count = 0
-                last_edge = y
-                edge_count += 1
-            elif start is not None and last_edge is not None and y - last_edge > 2:
-                span = last_edge - start + 1
-                if (
-                    span >= minimum_span
-                    and edge_count / span >= 0.70
-                    and (best is None or span > best[1] - best[0] + 1)
-                ):
-                    best = (start, last_edge)
-                start = last_edge = None
-                edge_count = 0
-        if start is not None and last_edge is not None:
-            span = last_edge - start + 1
+        for start, end_exclusive in _true_runs(bridged[:, x] > 0):
+            end = end_exclusive - 1
+            span = end - start + 1
+            if span < minimum_span:
+                continue
+            edge_count = int(np.count_nonzero(edge_mask[start : end + 1, x]))
             if (
-                span >= minimum_span
-                and edge_count / span >= 0.70
+                edge_count / span >= 0.70
                 and (best is None or span > best[1] - best[0] + 1)
             ):
-                best = (start, last_edge)
+                best = (start, end)
         if best is not None:
             raw_lines.append((x, best[0], best[1]))
 
@@ -492,6 +676,30 @@ def detect_table_regions(image: Image.Image) -> list[dict[str, Any]]:
         left = max(left_options) if left_options else cluster[0]["x"]
         right = min(right_options) if right_options else cluster[-1]["x"]
         bounds = [left, top, right, bottom]
+        row_slice = horizontal_edge_mask[
+            max(0, top - 2) : min(rgb.height, bottom + 3),
+            max(0, left) : min(rgb.width, right + 1),
+        ]
+        row_coverages = (
+            row_slice.mean(axis=1)
+            if row_slice.size
+            else np.asarray([], dtype=np.float32)
+        )
+        raw_row_lines = [
+            max(0, top - 2) + int(offset)
+            for offset in np.flatnonzero(row_coverages >= 0.45)
+        ]
+        row_lines: list[int] = []
+        for row_y in raw_row_lines:
+            if not row_lines or row_y > row_lines[-1] + 2:
+                row_lines.append(row_y)
+            else:
+                row_lines[-1] = round((row_lines[-1] + row_y) / 2)
+        # Navigation bars can also contain repeated vertical separators, but
+        # they normally have only a top and a bottom border. A data grid needs
+        # at least one internal horizontal separator as additional evidence.
+        if len(row_lines) < 3:
+            continue
         if any(existing["bounds"] == bounds for existing in tables):
             continue
         tables.append(
@@ -499,6 +707,7 @@ def detect_table_regions(image: Image.Image) -> list[dict[str, Any]]:
                 "kind": "table",
                 "bounds": bounds,
                 "columnLines": [line["x"] for line in cluster],
+                "rowLines": row_lines,
                 "confidence": round(min(1.0, len(cluster) / 8), 3),
             }
         )
@@ -682,7 +891,8 @@ def checkbox_bounds_match_label(
         return False
     width, height = right - left, bottom - top
     label_height = max(8.0, label_bottom - label_top)
-    if width < 8 or height < 8 or width > 48 or height > 48:
+    maximum_size = max(48.0, label_height * 3.2)
+    if width < 6 or height < 6 or width > maximum_size or height > maximum_size:
         return False
     if not 0.65 <= width / max(height, 1.0) <= 1.45:
         return False
@@ -868,6 +1078,32 @@ def match_checkbox_candidate(
     for candidate in candidates:
         left, top, right, bottom = candidate["bounds"]
         center_x, center_y = candidate["center"]
+        # OCR commonly groups an unselected square and its label into one text
+        # box without preserving a checkbox glyph in raw_text. A real square at
+        # the leading edge on the same row is stronger evidence than a nearby row.
+        prefix_limit = label.left + max(24.0, label_height * 1.25)
+        if (
+            label.left - 4 <= center_x <= prefix_limit
+            and abs(center_y - label_center_y) <= max(7.0, label_height * 0.45)
+            and checkbox_bounds_match_label(
+                candidate["bounds"],
+                label_bounds,
+                "ocr-prefix",
+            )
+        ):
+            matches.append(
+                {
+                    **candidate,
+                    "relation": "ocr-prefix",
+                    "score": round(
+                        135.0
+                        + min(10.0, float(candidate.get("score") or 0) * 0.05),
+                        3,
+                    ),
+                    "gap": 0.0,
+                }
+            )
+            continue
         relations: list[str] = []
         if right <= label.left + 2:
             relations.append("left")
@@ -907,6 +1143,11 @@ def match_checkbox_candidate(
     if not matches:
         return None
     horizontal = [
-        item for item in matches if item["relation"] in {"left", "right"}
+        item
+        for item in matches
+        if item["relation"] in {"ocr-prefix", "left", "right"}
     ]
-    return max(horizontal or matches, key=lambda item: item["score"])
+    best = max(horizontal or matches, key=lambda item: item["score"])
+    # A weak vertical association often belongs to the checkbox row directly
+    # above or below. Never preclassify such a guess as a reliable checkbox.
+    return best if best["score"] >= 42 else None

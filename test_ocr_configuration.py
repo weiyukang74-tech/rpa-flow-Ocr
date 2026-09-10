@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
-from ocr_marker import OcrItem, find_header_matches
+import numpy as np
+from PIL import Image
+
+from ocr_marker import OcrItem, find_header_matches, parse_ocr_result, run_ocr
 
 
 def item(text: str, left: int, top: int, width: int = 70) -> OcrItem:
@@ -57,6 +61,41 @@ class OcrConfigurationTests(unittest.TestCase):
                 1.0,
                 100,
             )
+
+    def test_low_confidence_text_can_be_collected_for_weak_candidates(self) -> None:
+        result = SimpleNamespace(
+            boxes=[[[10, 10], [40, 10], [40, 30], [10, 30]]],
+            txts=["模糊字段"],
+            scores=[0.30],
+        )
+
+        self.assertEqual(parse_ocr_result(result, 1.0), [])
+        weak_items = parse_ocr_result(result, 1.0, min_score=0.20)
+        self.assertEqual(len(weak_items), 1)
+        self.assertEqual(weak_items[0].text, "模糊字段")
+
+    def test_ocr_runs_in_memory_with_adaptive_scale_and_threshold(self) -> None:
+        calls = []
+
+        def engine(image: np.ndarray, **kwargs: object) -> SimpleNamespace:
+            calls.append((image.shape, kwargs))
+            return SimpleNamespace(
+                boxes=[[[20, 20], [80, 20], [80, 60], [20, 60]]],
+                txts=["姓名"],
+                scores=[0.90],
+            )
+
+        items = run_ocr(
+            engine,
+            Image.new("RGB", (1000, 500), "white"),
+            min_score=0.20,
+        )
+
+        self.assertEqual(calls[0][0], (1000, 2000, 3))
+        self.assertEqual(calls[0][1]["text_score"], 0.20)
+        self.assertFalse(calls[0][1]["use_cls"])
+        self.assertEqual(items[0].left, 10)
+        self.assertEqual(items[0].right, 40)
 
 
 if __name__ == "__main__":

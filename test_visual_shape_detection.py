@@ -21,6 +21,39 @@ from visual_shape_detection import (
 
 
 class VisualShapeDetectionTests(unittest.TestCase):
+    def test_checkbox_inside_ocr_label_prefix_stays_on_same_row(self) -> None:
+        label = SimpleNamespace(
+            left=1411,
+            top=212,
+            right=1507,
+            bottom=235,
+            raw_text="门急诊患者",
+        )
+        candidate = {
+            "bounds": [1416, 218, 1426, 228],
+            "center": [1421, 223],
+            "score": 57.4,
+        }
+        result = match_checkbox_candidate([candidate], label)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["relation"], "ocr-prefix")
+        self.assertEqual(result["center"], [1421, 223])
+
+    def test_rejects_vertical_checkbox_from_nearby_row(self) -> None:
+        label = SimpleNamespace(
+            left=1413,
+            top=239,
+            right=1493,
+            bottom=263,
+            raw_text="住院患者",
+        )
+        candidate = {
+            "bounds": [1416, 218, 1426, 228],
+            "center": [1421, 223],
+            "score": 57.4,
+        }
+        self.assertIsNone(match_checkbox_candidate([candidate], label))
     @staticmethod
     def checkbox_image(center: tuple[int, int]) -> Image.Image:
         image = Image.new("RGB", (360, 180), (245, 245, 245))
@@ -189,6 +222,47 @@ class VisualShapeDetectionTests(unittest.TestCase):
             all(
                 not (130 <= candidate["center"][0] <= 350 and 38 <= candidate["center"][1] <= 76)
                 for candidate in inventory["squareControls"]
+            )
+        )
+
+    def test_preserves_nonstandard_small_field_as_weak_candidate(self) -> None:
+        image = Image.new("RGB", (180, 100), (245, 245, 245))
+        ImageDraw.Draw(image).rectangle(
+            (30, 30, 69, 51),
+            fill=(255, 255, 255),
+            outline=(120, 150, 180),
+            width=2,
+        )
+        inventory = detect_visual_control_candidates(image)
+
+        self.assertEqual(inventory["fieldRectangles"], [])
+        self.assertTrue(
+            any(
+                candidate["bounds"][0] <= 31
+                and candidate["bounds"][2] >= 67
+                and candidate.get("confidenceLevel") == "weak"
+                for candidate in inventory["weakFieldRectangles"]
+            )
+        )
+
+    def test_strong_field_is_not_duplicated_in_weak_pool(self) -> None:
+        image = Image.new("RGB", (260, 120), (245, 245, 245))
+        ImageDraw.Draw(image).rectangle(
+            (30, 30, 190, 65),
+            fill=(255, 255, 255),
+            outline=(120, 150, 180),
+            width=2,
+        )
+        inventory = detect_visual_control_candidates(image)
+
+        self.assertTrue(inventory["fieldRectangles"])
+        strong_bounds = {
+            tuple(candidate["bounds"]) for candidate in inventory["fieldRectangles"]
+        }
+        self.assertFalse(
+            any(
+                tuple(candidate["bounds"]) in strong_bounds
+                for candidate in inventory["weakFieldRectangles"]
             )
         )
 
