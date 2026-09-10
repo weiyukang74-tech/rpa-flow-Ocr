@@ -63,7 +63,7 @@
           </div>
         </div>
         <div class="flow-note">
-          拖动步骤调整顺序。运行过程中请保持 HIS 可见，不要锁屏或操作鼠标键盘。
+          拖动步骤调整顺序。运行过程中请保持目标窗口可见，不要锁屏或操作鼠标键盘。
         </div>
         <div id="flow-list" class="flow-list"></div>
         <button id="add-hint" class="empty-add" hidden>从左侧添加第一个模块</button>
@@ -81,6 +81,15 @@
     </main>
 
     <section class="console-panel">
+      <div
+        id="console-resizer"
+        class="console-resizer"
+        role="separator"
+        aria-label="调整运行日志高度"
+        aria-orientation="horizontal"
+        tabindex="0"
+        title="上下拖动调整日志高度；双击恢复默认高度"
+      ></div>
       <div class="console-header">
         <div>
           <span class="eyebrow">RUN LOG</span>

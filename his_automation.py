@@ -70,9 +70,9 @@ def normalize_text(value: object) -> str:
 
 
 def activate_his_window() -> object:
-    """按标题连接并置前顶层窗口，不要求其 UIA 类型必须为 Window。"""
+    """通过 Win32 顶层窗口句柄按标题连接并置前窗口。"""
 
-    desktop = Desktop(backend="uia")
+    desktop = Desktop(backend="win32")
     deadline = time.monotonic() + 5.0
     available: list[str] = []
     wrapper: object | None = None
@@ -92,16 +92,7 @@ def activate_his_window() -> object:
             if normalize_text(item.window_text()) == WINDOW_TITLE
         ]
         if matches:
-            # 普通应用通常暴露为 Window；完全自绘、没有 UIA 控件树的
-            # 顶层窗口可能只暴露为 Pane。两者都属于可连接的顶层对象。
-            type_priority = {"Window": 0, "Pane": 1}
-            wrapper = min(
-                matches,
-                key=lambda item: type_priority.get(
-                    str(getattr(item.element_info, "control_type", "") or ""),
-                    2,
-                ),
-            )
+            wrapper = matches[0]
             break
         if time.monotonic() >= deadline:
             break
@@ -121,9 +112,7 @@ def activate_his_window() -> object:
         user32.ShowWindow(hwnd, 9)  # SW_RESTORE
         time.sleep(0.5)
 
-    # UIAWrapper.set_focus() 对没有 UIA Provider 的顶层 Pane 只尝试 UIA
-    # SetFocus，可能没有异常却也不改变窗口 Z 序。这里始终通过真实 HWND
-    # 执行顶层窗口置前，同时仍返回 UIA wrapper 供后续控件查找使用。
+    # 直接使用真实 HWND 置前，不读取应用内部的可访问性控件树。
     try:
         HwndWrapper(hwnd).set_focus()
     except Exception:
@@ -135,37 +124,6 @@ def activate_his_window() -> object:
     if int(user32.GetForegroundWindow() or 0) != hwnd:
         raise RuntimeError(f"已连接窗口 {WINDOW_TITLE!r}，但未能将其置于前台")
     return wrapper
-
-
-def find_hospitalization_field(window: object, timeout: float = 5.0) -> object | None:
-    """按 UIA 控件类型和 aria-label 查找“住院号”输入框。"""
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            matches = [
-                item
-                for item in window.descendants(control_type="Edit")
-                if normalize_text(getattr(item.element_info, "name", ""))
-                == "住院号"
-                and item.is_visible()
-                and item.is_enabled()
-            ]
-        except Exception:
-            matches = []
-        if len(matches) == 1:
-            return matches[0]
-        time.sleep(0.25)
-    return None
-
-
-def control_value(field: object) -> str | None:
-    """读取 UIA ValuePattern；控件不支持读取时返回 None。"""
-
-    try:
-        return normalize_text(field.get_value())
-    except Exception:
-        return None
 
 
 def type_and_submit() -> None:
@@ -182,8 +140,7 @@ def type_and_submit() -> None:
 def hospitalization_field_point(window: object) -> tuple[int, int, float]:
     """按新 HIS 网格布局和窗口 DPI 计算“住院号”输入框中心点。
 
-    Electron 默认未向 Windows UIA 暴露网页内部 Edit 控件，因此不能沿用
-    Java HIS 的 JAB/控件树定位。新界面使用固定的 6 列查询网格：住院号位于
+    该独立脚本不读取应用内部控件树。新界面使用固定的 6 列查询网格：住院号位于
     第 3 行第 2 列。横坐标按当前窗口宽度计算，纵坐标按 DPI 缩放后的固定
     工具栏高度计算；这能同时适配 100%、125%、150% 缩放和窗口宽度变化。
     """
@@ -212,33 +169,7 @@ def hospitalization_field_point(window: object) -> tuple[int, int, float]:
 
 
 def enter_hospitalization_number(window: object) -> tuple[tuple[int, int], str]:
-    """优先按 UIA 控件定位；不可用时才按布局坐标兜底。"""
-
-    field = find_hospitalization_field(window)
-    if field is not None:
-        rect = field.rectangle()
-        center_x = rect.left + (rect.right - rect.left) // 2
-        center_y = rect.top + (rect.bottom - rect.top) // 2
-        print(
-            f"按控件定位住院号输入框：x={center_x}, y={center_y}, "
-            "name='住院号', type='Edit'"
-        )
-        field.click_input()
-        time.sleep(0.2)
-        send_keys("^a", pause=0.08)
-        send_keys("{BACKSPACE}", pause=0.08)
-        send_keys(HOSPITALIZATION_NUMBER, pause=0.10)
-        time.sleep(0.3)
-        actual = control_value(field)
-        if actual is None or actual == HOSPITALIZATION_NUMBER:
-            send_keys("{ENTER}", pause=0.10)
-            print(
-                f"已向住院号控件写入 {HOSPITALIZATION_NUMBER}，并按下 Enter"
-            )
-            return (center_x, center_y), "uia-control"
-        print(
-            f"控件值校验未通过（实际={actual!r}），改用动态坐标兜底"
-        )
+    """旧的独立脚本仅保留显式坐标操作，不读取内部控件树。"""
 
     center_x, center_y, scale = hospitalization_field_point(window)
     print(
@@ -251,7 +182,7 @@ def enter_hospitalization_number(window: object) -> tuple[tuple[int, int], str]:
     print(
         f"已向住院号框写入 {HOSPITALIZATION_NUMBER}，并按下 Enter"
     )
-    return (center_x, center_y), "coordinate-fallback"
+    return (center_x, center_y), "coordinate"
 
 
 class HisApiClient:
@@ -346,35 +277,6 @@ def wait_for_submitted_query() -> list[dict[str, Any]]:
     )
 
 
-def find_query_result_control(window: object, timeout: float = 3.0) -> object | None:
-    """尝试按 UIA 名称找到包含目标住院号的患者结果行。"""
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            matches = []
-            for item in window.descendants():
-                name = normalize_text(getattr(item.element_info, "name", ""))
-                control_type = normalize_text(
-                    getattr(item.element_info, "control_type", "")
-                )
-                rect = item.rectangle()
-                if (
-                    HOSPITALIZATION_NUMBER in name
-                    and control_type in {"Button", "DataItem"}
-                    and rect.right - rect.left >= 300
-                    and item.is_visible()
-                    and item.is_enabled()
-                ):
-                    matches.append(item)
-            if len(matches) == 1:
-                return matches[0]
-        except Exception:
-            pass
-        time.sleep(0.25)
-    return None
-
-
 def query_result_row_point(window: object) -> tuple[int, int, float]:
     """按 HIS 查询表布局计算首条查询结果行内的安全点击点。"""
 
@@ -394,19 +296,7 @@ def query_result_row_point(window: object) -> tuple[int, int, float]:
 
 
 def click_query_result(window: object) -> str:
-    """点击目标查询结果行，使 HIS 进入医嘱费用查询页面。"""
-
-    row = find_query_result_control(window)
-    if row is not None:
-        rect = row.rectangle()
-        center_x = rect.left + (rect.right - rect.left) // 2
-        center_y = rect.top + (rect.bottom - rect.top) // 2
-        print(
-            f"按控件点击查询结果：x={center_x}, y={center_y}, "
-            f"住院号={HOSPITALIZATION_NUMBER}"
-        )
-        row.click_input()
-        return "uia-control"
+    """旧的独立脚本仅保留显式坐标点击，不读取内部控件树。"""
 
     center_x, center_y, scale = query_result_row_point(window)
     print(
@@ -414,7 +304,7 @@ def click_query_result(window: object) -> str:
         f"DPI缩放={scale:.2f}"
     )
     mouse.click(button="left", coords=(center_x, center_y))
-    return "coordinate-fallback"
+    return "coordinate"
 
 
 def wait_for_result_navigation() -> int:

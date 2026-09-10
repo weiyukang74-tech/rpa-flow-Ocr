@@ -12,6 +12,8 @@ const state = {
   run: null,
   hiddenLogs: false,
   logCollapsed: false,
+  logFollowTail: true,
+  logHeight: 222,
   customDraft: null,
 };
 
@@ -52,7 +54,7 @@ function moduleInitialParams(module) {
 }
 
 function moduleIcon(category) {
-  return ({ HIS: "H", "窗口": "窗", "截图": "图", OCR: "识", "通用": "通" })[category] || "·";
+  return ({ "视觉": "视", "窗口": "窗", "截图": "图", OCR: "识", "通用": "通" })[category] || "·";
 }
 
 function renderPalette() {
@@ -444,7 +446,7 @@ async function createConfig() {
     steps: [{
       id: newId(),
       type: "window.activate",
-      name: "连接 HIS 窗口",
+      name: "连接窗口",
       enabled: true,
       params: { windowTitle: "医院信息系统（HIS）" },
     }],
@@ -471,10 +473,79 @@ function toggleLogPanel() {
   $("#toggle-log-button").textContent = state.logCollapsed ? "展开日志" : "收起日志";
 }
 
+function isLogNearBottom(log) {
+  return log.scrollHeight - log.scrollTop - log.clientHeight <= 24;
+}
+
+function clampLogHeight(value) {
+  const minimum = 140;
+  const maximum = Math.max(minimum, window.innerHeight - 300);
+  return Math.min(maximum, Math.max(minimum, Math.round(value)));
+}
+
+function applyLogHeight(value, persist = false) {
+  state.logHeight = clampLogHeight(value);
+  $("#page-flow").style.setProperty("--console-height", `${state.logHeight}px`);
+  const resizer = $("#console-resizer");
+  resizer.setAttribute("aria-valuemin", "140");
+  resizer.setAttribute("aria-valuemax", String(Math.max(140, window.innerHeight - 300)));
+  resizer.setAttribute("aria-valuenow", String(state.logHeight));
+  if (persist) {
+    try { localStorage.setItem("rpa-log-height", String(state.logHeight)); } catch (_error) { /* ignore */ }
+  }
+}
+
+function setupLogPanelResize() {
+  const resizer = $("#console-resizer");
+  let startY = 0;
+  let startHeight = state.logHeight;
+  let dragging = false;
+
+  try {
+    const saved = Number(localStorage.getItem("rpa-log-height"));
+    if (Number.isFinite(saved) && saved > 0) state.logHeight = saved;
+  } catch (_error) { /* ignore */ }
+  applyLogHeight(state.logHeight);
+
+  resizer.addEventListener("pointerdown", (event) => {
+    if (state.logCollapsed) return;
+    event.preventDefault();
+    dragging = true;
+    startY = event.clientY;
+    startHeight = $(".console-panel").getBoundingClientRect().height;
+    resizer.classList.add("dragging");
+    document.body.classList.add("resizing-log");
+    resizer.setPointerCapture?.(event.pointerId);
+  });
+  resizer.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    applyLogHeight(startHeight + startY - event.clientY);
+  });
+  const finishResize = (event) => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove("dragging");
+    document.body.classList.remove("resizing-log");
+    if (resizer.hasPointerCapture?.(event.pointerId)) resizer.releasePointerCapture(event.pointerId);
+    applyLogHeight(state.logHeight, true);
+  };
+  resizer.addEventListener("pointerup", finishResize);
+  resizer.addEventListener("pointercancel", finishResize);
+  resizer.addEventListener("dblclick", () => applyLogHeight(222, true));
+  resizer.addEventListener("keydown", (event) => {
+    if (event.key === "ArrowUp" || event.key === "ArrowDown") {
+      event.preventDefault();
+      applyLogHeight(state.logHeight + (event.key === "ArrowUp" ? 24 : -24), true);
+    }
+  });
+  window.addEventListener("resize", () => applyLogHeight(state.logHeight));
+}
+
 async function startRun(untilStepId = null) {
   if (state.run?.status === "running") return;
   readHeaderInputs();
   state.hiddenLogs = false;
+  state.logFollowTail = true;
   const variables = { hospitalization_number: state.config.variables.hospitalization_number };
   const data = await api("/api/run", {
     method: "POST",
@@ -515,11 +586,13 @@ function renderRun() {
   // 日志展开状态完全由用户控制；轮询、失败和取消都不能自动弹开面板。
 
   const log = $("#run-log");
+  const previousScrollTop = log.scrollTop;
+  const shouldFollowTail = state.logFollowTail;
   if (state.hiddenLogs || !run.logs?.length) {
     log.innerHTML = `<div class="log-placeholder">${state.hiddenLogs ? "日志显示已清空；新日志到达后会重新显示" : "尚未运行任务"}</div>`;
   } else {
     log.innerHTML = run.logs.map((item) => `<div class="log-row ${escapeHtml(item.level)}"><span class="log-time">${escapeHtml(item.time)}</span><span class="log-level">${escapeHtml(item.level)}</span><span>${escapeHtml(item.message)}</span></div>`).join("");
-    log.scrollTop = log.scrollHeight;
+    log.scrollTop = shouldFollowTail ? log.scrollHeight : previousScrollTop;
   }
   const result = $("#run-result");
   if (run.result) {
@@ -571,8 +644,16 @@ async function init() {
   $("#run-button").addEventListener("click", () => startRun().catch((error) => showToast(error.message, true)));
   $("#cancel-run-button").addEventListener("click", () => cancelRun().catch((error) => showToast(error.message, true)));
   $("#run-to-button").addEventListener("click", () => startRun(state.selectedStepId).catch((error) => showToast(error.message, true)));
-  $("#clear-log-button").addEventListener("click", () => { state.hiddenLogs = true; renderRun(); });
+  $("#clear-log-button").addEventListener("click", () => {
+    state.hiddenLogs = true;
+    state.logFollowTail = true;
+    renderRun();
+  });
   $("#toggle-log-button").addEventListener("click", toggleLogPanel);
+  $("#run-log").addEventListener("scroll", () => {
+    state.logFollowTail = isLogNearBottom($("#run-log"));
+  }, { passive: true });
+  setupLogPanelResize();
   document.querySelectorAll(".page-tab").forEach((tab) => tab.addEventListener("click", () => switchPage(tab.dataset.page)));
   $("#new-module-button").addEventListener("click", () => openModuleDialog());
   $("#new-module-config-button").addEventListener("click", () => openModuleDialog());

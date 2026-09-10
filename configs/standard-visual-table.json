@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "name": "标准-HIS住院号医嘱取证",
+  "name": "标准视觉表格取证",
   "variables": {
     "hospitalization_number": "ZY26031245"
   },
@@ -11,51 +11,62 @@
     {
       "id": "standard-01-activate",
       "type": "window.activate",
-      "name": "01 连接 HIS 窗口",
+      "name": "01 连接窗口",
       "enabled": true,
       "params": { "windowTitle": "医院信息系统（HIS）" }
     },
     {
       "id": "standard-02-maximize",
       "type": "window.maximize",
-      "name": "02 最大化 HIS 窗口",
+      "name": "02 最大化窗口",
       "enabled": true,
       "params": { "layoutWaitSeconds": 0.6 }
     },
     {
       "id": "standard-03-input",
-      "type": "his.input_hospitalization",
+      "type": "visual.input_field",
       "name": "03 填写住院号并回车",
       "enabled": true,
-      "params": { "value": "${hospitalization_number}" }
+      "params": {
+        "fieldName": "住院号",
+        "value": "${hospitalization_number}",
+        "pressEnter": true,
+        "visualPage": "current-page"
+      }
     },
     {
       "id": "standard-04-wait-query",
-      "type": "his.wait_query",
-      "name": "04 等待患者查询结果",
+      "type": "utility.wait",
+      "name": "04 等待查询结果",
       "enabled": true,
-      "params": { "timeoutSeconds": 30 }
+      "params": { "seconds": 1 }
     },
     {
       "id": "standard-05-click-result",
-      "type": "his.click_first_result",
-      "name": "05 点击第一条查询结果",
+      "type": "visual.click_table_row",
+      "name": "05 点击表格第一行",
       "enabled": true,
-      "params": { "row": 1 }
+      "params": {
+        "tableTitle": "患者查询",
+        "headerText": "序号",
+        "row": 1,
+        "clickColumn": "序号",
+        "visualPage": "current-page"
+      }
     },
     {
       "id": "standard-06-wait-orders",
-      "type": "his.wait_navigation",
-      "name": "06 等待医嘱页面",
+      "type": "utility.wait",
+      "name": "06 等待页面加载",
       "enabled": true,
-      "params": { "timeoutSeconds": 30 }
+      "params": { "seconds": 1 }
     },
     {
       "id": "standard-07-current",
       "type": "capture.current",
       "name": "07 截取当前位置",
       "enabled": true,
-      "params": { "filePrefix": "his_inpatient_${hospitalization_number}" }
+      "params": { "filePrefix": "table_${hospitalization_number}" }
     },
     {
       "id": "standard-08-rightmost",
@@ -63,7 +74,7 @@
       "name": "08 截取横向最右端",
       "enabled": true,
       "params": {
-        "filePrefix": "his_inpatient_${hospitalization_number}",
+        "filePrefix": "table_${hospitalization_number}",
         "restorePosition": true,
         "layoutWaitSeconds": 0.5
       }

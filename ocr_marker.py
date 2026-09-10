@@ -75,7 +75,7 @@ def maximize_his_window() -> None:
     try:
         is_maximized = bool(window.is_maximized())
     except Exception:
-        # 个别 UIA 后端不支持 is_maximized；调用 maximize 本身是幂等操作。
+        # 个别窗口包装器不支持 is_maximized；调用 maximize 本身是幂等操作。
         is_maximized = False
 
     if is_maximized:

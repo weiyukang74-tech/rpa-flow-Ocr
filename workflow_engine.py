@@ -32,6 +32,7 @@ class ModuleDefinition:
     description: str
     fields: tuple[dict[str, Any], ...]
     handler: Callable[["ExecutionContext", dict[str, Any]], Any]
+    hidden: bool = False
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -120,7 +121,11 @@ class WorkflowRegistry:
         return [
             definition.public_dict()
             for definition in sorted(
-                self._definitions.values(),
+                (
+                    definition
+                    for definition in self._definitions.values()
+                    if not definition.hidden
+                ),
                 key=lambda item: (item.category, item.name),
             )
         ]

@@ -19,7 +19,7 @@
     },
     {
       "id": "step-mtkzmcf2-9kd29",
-      "type": "his.input_field",
+      "type": "visual.input_field",
       "name": "填写科室名",
       "enabled": true,
       "params": {
@@ -32,29 +32,33 @@
     },
     {
       "id": "step-mtkzms31-60mf3",
-      "type": "his.wait_query",
-      "name": "等待患者查询结果",
+      "type": "utility.wait",
+      "name": "等待查询结果",
       "enabled": true,
       "params": {
-        "timeoutSeconds": 30
+        "seconds": 1
       }
     },
     {
       "id": "step-mtkzmsvz-7jlv4",
-      "type": "his.click_first_result",
-      "name": "点击查询结果",
+      "type": "visual.click_table_row",
+      "name": "点击表格第一行",
       "enabled": true,
       "params": {
-        "row": 1
+        "tableTitle": "患者查询",
+        "headerText": "序号",
+        "row": 1,
+        "clickColumn": "序号",
+        "visualPage": "current-page"
       }
     },
     {
       "id": "step-mtkzmtqj-8ke5x",
-      "type": "his.wait_navigation",
-      "name": "等待医嘱页面",
+      "type": "utility.wait",
+      "name": "等待页面加载",
       "enabled": true,
       "params": {
-        "timeoutSeconds": 30
+        "seconds": 1
       }
     },
     {
@@ -63,7 +67,7 @@
       "name": "截取当前位置",
       "enabled": true,
       "params": {
-        "filePrefix": "his_inpatient_${hospitalization_number}"
+        "filePrefix": "table_${hospitalization_number}"
       }
     },
     {
@@ -72,7 +76,7 @@
       "name": "截取横向最右端",
       "enabled": true,
       "params": {
-        "filePrefix": "his_inpatient_${hospitalization_number}",
+        "filePrefix": "table_${hospitalization_number}",
         "restorePosition": true,
         "layoutWaitSeconds": 0.5
       }

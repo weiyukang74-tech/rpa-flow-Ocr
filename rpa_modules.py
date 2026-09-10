@@ -1,4 +1,4 @@
-"""Built-in modules that bridge JSON steps to the verified HIS RPA functions."""
+"""Built-in OCR-first modules for generic Windows desktop workflows."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw, ImageGrab
 
 STUDIO_ROOT = Path(__file__).resolve().parent
 
-import his_automation as his
+import his_automation as window_adapter
 import ocr_marker as marker
 from visual_shape_detection import (
     checkbox_bounds_match_label,
@@ -67,18 +67,19 @@ def visual_page_field(default: str = "current-page") -> dict[str, Any]:
 
 
 def current_window(context: ExecutionContext) -> Any:
-    window = his.activate_his_window()
-    context.state["window"] = window
+    window = context.state.get("window")
+    if window is None:
+        raise WorkflowExecutionError("尚未连接目标窗口，请先执行“连接窗口”步骤")
     return window
 
 
 def run_window_activate(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
-    title = str(params.get("windowTitle") or his.WINDOW_TITLE).strip()
+    title = str(params.get("windowTitle") or window_adapter.WINDOW_TITLE).strip()
     if not title:
         raise WorkflowExecutionError("窗口标题不能为空")
-    his.WINDOW_TITLE = title
+    window_adapter.WINDOW_TITLE = title
     marker.base.WINDOW_TITLE = title
-    window = his.activate_his_window()
+    window = window_adapter.activate_his_window()
     context.state["window"] = window
     return {"windowTitle": title}
 
@@ -92,120 +93,22 @@ def run_window_maximize(context: ExecutionContext, params: dict[str, Any]) -> di
     user32 = ctypes.windll.user32
     was_maximized = bool(user32.IsZoomed(hwnd))
     if not was_maximized:
-        # 最大化属于顶层窗口状态，不依赖 UIA 类型、标题栏样式或按钮位置。
+        # 最大化属于顶层窗口状态，不依赖应用内部控件树或按钮位置。
         user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
         context.wait(float(params.get("layoutWaitSeconds", 0.6)))
         if not user32.IsZoomed(hwnd):
             raise WorkflowExecutionError(
                 "Windows 已收到最大化命令，但目标顶层窗口没有进入最大化状态"
             )
-        context.emit("info", "HIS 窗口已最大化", None)
+        context.emit("info", "目标窗口已最大化", None)
     else:
-        context.emit("info", "HIS 窗口已经是最大化状态", None)
+        context.emit("info", "目标窗口已经是最大化状态", None)
     rect = window.rectangle()
     return {
         "wasAlreadyMaximized": was_maximized,
         "hwnd": hwnd,
         "rectangle": [rect.left, rect.top, rect.right, rect.bottom],
     }
-
-
-def control_is_within_screen_bounds(control: Any, bounds: list[int] | None) -> bool:
-    if bounds is None:
-        return True
-    try:
-        rect = control.rectangle()
-    except Exception:
-        return False
-    center = [
-        rect.left + (rect.right - rect.left) // 2,
-        rect.top + (rect.bottom - rect.top) // 2,
-    ]
-    return point_is_inside_bounds(center, bounds)
-
-
-def find_his_edit_control(
-    window: Any,
-    field_name: str,
-    timeout: float = 5.0,
-    required_screen_bounds: list[int] | None = None,
-) -> Any | None:
-    """Find one visible edit by its accessible field name."""
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            matches = [
-                item
-                for item in window.descendants(control_type="Edit")
-                if his.normalize_text(getattr(item.element_info, "name", ""))
-                == field_name
-                and item.is_visible()
-                and item.is_enabled()
-                and control_is_within_screen_bounds(item, required_screen_bounds)
-            ]
-        except Exception:
-            matches = []
-        if len(matches) == 1:
-            return matches[0]
-        time.sleep(0.2)
-    return None
-
-
-def find_named_his_control(
-    window: Any,
-    name: str,
-    control_types: set[str] | None,
-    timeout: float,
-    contains: bool = False,
-    required_screen_bounds: list[int] | None = None,
-) -> Any | None:
-    """Find a visible HIS control by accessible name and optional control types."""
-
-    target = his.normalize_text(name)
-    deadline = time.monotonic() + max(0, timeout)
-    while True:
-        try:
-            matches: list[Any] = []
-            for item in window.descendants():
-                item_name = his.normalize_text(getattr(item.element_info, "name", ""))
-                item_type = str(getattr(item.element_info, "control_type", "") or "")
-                name_matches = target in item_name if contains else item_name == target
-                if (
-                    name_matches
-                    and (not control_types or item_type in control_types)
-                    and item.is_visible()
-                    and item.is_enabled()
-                    and control_is_within_screen_bounds(item, required_screen_bounds)
-                ):
-                    matches.append(item)
-        except Exception:
-            matches = []
-        if matches:
-            type_priority = {
-                "Button": 0,
-                "CheckBox": 0,
-                "ComboBox": 0,
-                "Hyperlink": 1,
-                "TabItem": 1,
-                "MenuItem": 1,
-                "DataItem": 2,
-                "ListItem": 2,
-                "Text": 3,
-            }
-            return min(
-                matches,
-                key=lambda item: (
-                    type_priority.get(
-                        str(getattr(item.element_info, "control_type", "") or ""), 9
-                    ),
-                    item.rectangle().top,
-                    item.rectangle().left,
-                ),
-            )
-        if time.monotonic() >= deadline:
-            return None
-        time.sleep(0.2)
 
 
 VISUAL_MAP_ROOT = STUDIO_ROOT / "configs" / "visual-maps"
@@ -234,11 +137,11 @@ def visual_window_signature(
         "locatorVersion": 6,
         "page": page,
         "stateFingerprint": state_fingerprint,
-        "windowTitle": his.normalize_text(window.window_text()),
+        "windowTitle": window_adapter.normalize_text(window.window_text()),
         "className": str(getattr(window.element_info, "class_name", "") or ""),
         "width": width,
         "height": height,
-        "dpiScale": round(float(his.window_dpi_scale(window)), 3),
+        "dpiScale": round(float(window_adapter.window_dpi_scale(window)), 3),
     }
 
 
@@ -720,22 +623,6 @@ def capture_visual_window(window: Any) -> Image.Image:
         bbox=(rect.left, rect.top, rect.right, rect.bottom)
     ) as screenshot:
         return screenshot.convert("RGB")
-
-
-def active_foreground_screen_bounds(window: Any) -> list[int] | None:
-    """Return the active visual dialog in screen coordinates, when present."""
-
-    foreground = detect_foreground_panel(capture_visual_window(window))
-    local_bounds = foreground.get("bounds") if isinstance(foreground, dict) else None
-    if not isinstance(local_bounds, list) or len(local_bounds) != 4:
-        return None
-    rect = window.rectangle()
-    return [
-        rect.left + local_bounds[0],
-        rect.top + local_bounds[1],
-        rect.left + local_bounds[2],
-        rect.top + local_bounds[3],
-    ]
 
 
 def capture_stable_visual_window(
@@ -1804,7 +1691,7 @@ def visual_checkbox_point(
 
 
 def visual_checkbox_state(point: tuple[int, int]) -> bool:
-    """Detect the HIS blue checked state around a fallback checkbox point."""
+    """Detect a common blue checked state around a visual checkbox point."""
 
     x, y = point
     with ImageGrab.grab(bbox=(x - 9, y - 9, x + 10, y + 10)) as image:
@@ -1820,7 +1707,6 @@ def visual_checkbox_state(point: tuple[int, int]) -> bool:
 def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
     field_name = str(params.get("fieldName") or "").strip()
     value = str(params.get("value") or "").strip()
-    timeout = float(params.get("timeoutSeconds", 5))
     submit = bool(params.get("pressEnter", True))
     if not field_name:
         raise WorkflowExecutionError("目标字段名称不能为空")
@@ -1848,27 +1734,12 @@ def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> di
             page=page,
             force_new=True,
         )
-    if point is not None:
-        mouse.click(button="left", coords=point)
-        locator_mode = "visual-map"
-    else:
-        control = find_his_edit_control(
-            window,
-            field_name,
-            timeout,
-            required_screen_bounds=active_foreground_screen_bounds(window),
+    if point is None:
+        raise WorkflowExecutionError(
+            f"完整 OCR 页面布局中仍未找到字段“{field_name}”，未执行输入"
         )
-        if control is None:
-            raise WorkflowExecutionError(
-                f"视觉页面布局中未找到字段“{field_name}”，UIA 也无法识别该字段"
-            )
-        control.click_input()
-        locator_mode = "uia-control"
-        rect = control.rectangle()
-        point = (
-            rect.left + (rect.right - rect.left) // 2,
-            rect.top + (rect.bottom - rect.top) // 2,
-        )
+    mouse.click(button="left", coords=point)
+    locator_mode = "visual-map"
 
     time.sleep(0.15)
     send_keys("^a", pause=0.06)
@@ -1879,15 +1750,9 @@ def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> di
         send_keys("{ENTER}", pause=0.08)
     context.emit(
         "info",
-        f"已填写 HIS 字段“{field_name}”{('并按回车' if submit else '')}；定位方式={locator_mode}",
+        f"已填写字段“{field_name}”{('并按回车' if submit else '')}；定位方式={locator_mode}",
         None,
     )
-    if field_name == "卡号" and his.HIS_URL.startswith("http://127.0.0.1:51321"):
-        context.emit(
-            "warning",
-            "当前模拟 HIS 的卡号输入框未接入患者查询条件；模块可完成填写，但 demo 不会按卡号过滤结果",
-            None,
-        )
     return {
         "fieldName": field_name,
         "value": value,
@@ -1900,7 +1765,6 @@ def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> di
 def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
     field_name = str(params.get("fieldName") or "").strip()
     option_text = str(params.get("optionText") or "").strip()
-    timeout = float(params.get("timeoutSeconds", 5))
     if not field_name:
         raise WorkflowExecutionError("下拉框字段名称不能为空")
     if not option_text:
@@ -1929,10 +1793,28 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
             page=page,
             force_new=True,
         )
-    if point is not None:
-        mouse.click(button="left", coords=point)
-        context.wait(0.25)
-        option_page = f"{page}:expanded:{field_name}"[:80]
+    if point is None:
+        raise WorkflowExecutionError(
+            f"完整 OCR 页面布局中仍未找到下拉框“{field_name}”，未执行选择"
+        )
+    mouse.click(button="left", coords=point)
+    context.wait(0.25)
+    option_page = f"{page}:expanded:{field_name}"[:80]
+    option_point = visual_text_point(
+        context,
+        window,
+        option_text,
+        contains=False,
+        page=option_page,
+        role="option",
+        parent_page_map=source_map,
+    )
+    if option_point is None:
+        context.emit(
+            "info",
+            f"视觉地图未找到下拉项“{option_text}”，刷新展开状态后再次视觉识别",
+            None,
+        )
         option_point = visual_text_point(
             context,
             window,
@@ -1941,37 +1823,14 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
             page=option_page,
             role="option",
             parent_page_map=source_map,
+            force_new=True,
         )
-        if option_point is not None:
-            mouse.click(button="left", coords=option_point)
-            locator_mode = "visual-map"
-        else:
-            send_keys("{HOME}", pause=0.06)
-            send_keys(option_text, pause=0.08)
-            send_keys("{ENTER}", pause=0.06)
-            locator_mode = "visual-map-keyboard"
-    else:
-        control = find_named_his_control(
-            window,
-            field_name,
-            {"ComboBox"},
-            timeout,
-            required_screen_bounds=active_foreground_screen_bounds(window),
+    if option_point is None:
+        raise WorkflowExecutionError(
+            f"OCR 未识别到下拉项“{option_text}”，未执行选择"
         )
-        if control is None:
-            raise WorkflowExecutionError(
-                f"视觉页面布局中未找到下拉框“{field_name}”，UIA 也无法识别该控件"
-            )
-        try:
-            control.select(option_text)
-        except Exception:
-            control.click_input()
-            send_keys("{HOME}", pause=0.06)
-            send_keys(option_text, pause=0.08)
-            send_keys("{ENTER}", pause=0.06)
-        locator_mode = "uia-control"
-        rect = control.rectangle()
-        point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
+    mouse.click(button="left", coords=option_point)
+    locator_mode = "visual-map"
 
     context.emit(
         "info",
@@ -1989,7 +1848,6 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
 def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
     checkbox_name = str(params.get("checkboxName") or "").strip()
     target_state = str(params.get("targetState") or "勾选").strip()
-    timeout = float(params.get("timeoutSeconds", 5))
     if not checkbox_name:
         raise WorkflowExecutionError("勾选框名称不能为空")
     if target_state not in {"勾选", "取消勾选", "切换"}:
@@ -2016,42 +1874,19 @@ def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> d
             page=page,
             force_new=True,
         )
-    if point is not None:
-        locator_mode = "visual-map"
-        current_state = visual_checkbox_state(point)
-        should_click = (
-            target_state == "切换"
-            or (target_state == "勾选" and not current_state)
-            or (target_state == "取消勾选" and current_state)
+    if point is None:
+        raise WorkflowExecutionError(
+            f"完整 OCR 页面布局中仍未找到勾选框“{checkbox_name}”，未执行操作"
         )
-        if should_click:
-            mouse.click(button="left", coords=point)
-    else:
-        control = find_named_his_control(
-            window,
-            checkbox_name,
-            {"CheckBox"},
-            timeout,
-            required_screen_bounds=active_foreground_screen_bounds(window),
-        )
-        if control is None:
-            raise WorkflowExecutionError(
-                f"视觉页面布局中未找到勾选框“{checkbox_name}”，UIA 也无法识别该控件"
-            )
-        try:
-            current_state = bool(control.get_toggle_state())
-        except Exception:
-            current_state = bool(control.iface_toggle.CurrentToggleState)
-        rect = control.rectangle()
-        point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
-        locator_mode = "uia-control"
-        should_click = (
-            target_state == "切换"
-            or (target_state == "勾选" and not current_state)
-            or (target_state == "取消勾选" and current_state)
-        )
-        if should_click:
-            control.click_input()
+    locator_mode = "visual-map"
+    current_state = visual_checkbox_state(point)
+    should_click = (
+        target_state == "切换"
+        or (target_state == "勾选" and not current_state)
+        or (target_state == "取消勾选" and current_state)
+    )
+    if should_click:
+        mouse.click(button="left", coords=point)
     final_state = not current_state if should_click else current_state
     context.emit(
         "info",
@@ -2070,29 +1905,15 @@ def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> d
 
 def run_his_click_object(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
     target_name = str(params.get("targetName") or "").strip()
-    control_type = str(params.get("controlType") or "自动").strip()
     match_mode = str(params.get("matchMode") or "精确匹配").strip()
-    timeout = float(params.get("timeoutSeconds", 5))
     if not target_name:
         raise WorkflowExecutionError("点击对象名称不能为空")
-    allowed_types = {
-        "Button",
-        "Hyperlink",
-        "TabItem",
-        "MenuItem",
-        "Text",
-        "DataItem",
-        "ListItem",
-    }
-    if control_type != "自动" and control_type not in allowed_types:
-        raise WorkflowExecutionError("点击对象控件类型无效")
     if match_mode not in {"精确匹配", "包含文字"}:
         raise WorkflowExecutionError("点击对象匹配方式无效")
 
     window = current_window(context)
     page = visual_page_id(params)
     context.state.pop("last_visual_resolved_map", None)
-    control_types = allowed_types if control_type == "自动" else {control_type}
     point = visual_text_point(
         context,
         window,
@@ -2114,50 +1935,35 @@ def run_his_click_object(context: ExecutionContext, params: dict[str, Any]) -> d
             page=page,
             force_new=True,
         )
-    if point is not None:
-        mouse.click(button="left", coords=point)
-        locator_mode = "visual-map"
-        resolved_map = context.state.get("last_visual_resolved_map")
-        if isinstance(resolved_map, dict) and resolved_map.get("parentSignature"):
-            signatures = [
-                resolved_map.get("signature"),
-                resolved_map.get("parentSignature"),
-            ]
-            context.state["pending_visual_page_transition"] = {
-                "page": page,
-                "trigger": target_name,
-                "excludedFingerprints": [
-                    signature.get("stateFingerprint")
-                    for signature in signatures
-                    if isinstance(signature, dict)
-                ],
-            }
-    else:
-        control = find_named_his_control(
-            window,
-            target_name,
-            control_types,
-            timeout,
-            contains=match_mode == "包含文字",
-            required_screen_bounds=active_foreground_screen_bounds(window),
+    if point is None:
+        raise WorkflowExecutionError(
+            f"完整 OCR 页面布局中仍未找到对象“{target_name}”，未执行点击"
         )
-        if control is None:
-            raise WorkflowExecutionError(
-                f"视觉页面布局中未找到对象“{target_name}”，UIA 也无法识别该对象"
-            )
-        control.click_input()
-        rect = control.rectangle()
-        point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
-        locator_mode = "uia-control"
+    mouse.click(button="left", coords=point)
+    locator_mode = "visual-map"
+    resolved_map = context.state.get("last_visual_resolved_map")
+    if isinstance(resolved_map, dict) and resolved_map.get("parentSignature"):
+        signatures = [
+            resolved_map.get("signature"),
+            resolved_map.get("parentSignature"),
+        ]
+        context.state["pending_visual_page_transition"] = {
+            "page": page,
+            "trigger": target_name,
+            "excludedFingerprints": [
+                signature.get("stateFingerprint")
+                for signature in signatures
+                if isinstance(signature, dict)
+            ],
+        }
 
     context.emit(
         "info",
-        f"已点击 HIS 对象“{target_name}”；定位方式={locator_mode}",
+        f"已点击对象“{target_name}”；定位方式={locator_mode}",
         None,
     )
     return {
         "targetName": target_name,
-        "controlType": control_type,
         "matchMode": match_mode,
         "locatorMode": locator_mode,
         "point": list(point),
@@ -2168,7 +1974,7 @@ def run_his_input_number(context: ExecutionContext, params: dict[str, Any]) -> d
     number = str(params.get("value") or "").strip()
     if not number:
         raise WorkflowExecutionError("住院号不能为空")
-    his.HOSPITALIZATION_NUMBER = number
+    window_adapter.HOSPITALIZATION_NUMBER = number
     marker.base.HOSPITALIZATION_NUMBER = number
     context.variables["hospitalization_number"] = number
     window = current_window(context)
@@ -2192,24 +1998,12 @@ def run_his_input_number(context: ExecutionContext, params: dict[str, Any]) -> d
             page=page,
             force_new=True,
         )
-    if point is not None:
-        mouse.click(button="left", coords=point)
-        locator_mode = "visual-map"
-    else:
-        control = find_his_edit_control(
-            window,
-            "住院号",
-            5.0,
-            required_screen_bounds=active_foreground_screen_bounds(window),
+    if point is None:
+        raise WorkflowExecutionError(
+            "完整 OCR 页面布局中仍未找到住院号输入框，未执行输入"
         )
-        if control is None:
-            raise WorkflowExecutionError(
-                "视觉页面布局中未找到住院号输入框，UIA 也无法识别该字段"
-            )
-        control.click_input()
-        rect = control.rectangle()
-        point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
-        locator_mode = "uia-control"
+    mouse.click(button="left", coords=point)
+    locator_mode = "visual-map"
     time.sleep(0.15)
     send_keys("^a", pause=0.06)
     send_keys("{BACKSPACE}", pause=0.06)
@@ -2224,72 +2018,242 @@ def run_his_input_number(context: ExecutionContext, params: dict[str, Any]) -> d
     return {"value": number, "locatorMode": locator_mode, "point": list(point)}
 
 
-def run_his_wait_query(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
-    timeout = float(params.get("timeoutSeconds", 30))
-    client = his.HisApiClient(his.HIS_URL)
-    client.post("/api/session/bootstrap")
-    projection = client.get("/api/view")
-    if his.normalize_text((projection.get("session") or {}).get("status")) != "active":
-        client.post("/api/command", {"type": "session.login"})
-    deadline = time.monotonic() + timeout
-    last_query: dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        context.check_cancelled()
-        projection = client.get("/api/view")
-        last_query = ((projection.get("query") or {}).get("patient") or {})
-        rows = projection.get("patientEncounterRows") or []
-        if (
-            his.normalize_text(last_query.get("hospitalizationNumber"))
-            == his.HOSPITALIZATION_NUMBER
-            and isinstance(rows, list)
-            and rows
-            and all(
-                his.normalize_text(row.get("hospitalizationNumber"))
-                == his.HOSPITALIZATION_NUMBER
-                for row in rows
+def _ocr_row_groups(items: list[Any], minimum_y: int) -> list[list[Any]]:
+    """Group OCR fragments into visual rows below one table header."""
+
+    candidates = sorted(
+        (
+            item
+            for item in items
+            if (item.top + item.bottom) // 2 > minimum_y
+        ),
+        key=lambda item: ((item.top + item.bottom) // 2, item.left),
+    )
+    groups: list[list[Any]] = []
+    for item in candidates:
+        center_y = (item.top + item.bottom) // 2
+        if groups:
+            group_y = round(
+                sum((member.top + member.bottom) // 2 for member in groups[-1])
+                / len(groups[-1])
             )
-        ):
-            return {"rowCount": len(rows)}
-        context.wait(0.5)
-    raise WorkflowExecutionError(
-        f"{timeout:g} 秒内未等到住院号 {his.HOSPITALIZATION_NUMBER} 的查询结果；最后条件={last_query}"
+            tolerance = max(
+                8,
+                round(
+                    sum(max(1, member.bottom - member.top) for member in groups[-1])
+                    / len(groups[-1])
+                    * 0.7
+                ),
+            )
+            if abs(center_y - group_y) <= tolerance:
+                groups[-1].append(item)
+                continue
+        groups.append([item])
+    return groups
+
+
+def _find_table_header(
+    items: list[Any],
+    header_text: str,
+    table_title: str,
+    foreground_bounds: list[int] | None,
+) -> tuple[Any, list[Any]] | None:
+    """Find a header label and the OCR fragments belonging to its header row."""
+
+    normalized_header = marker.normalize_ocr_text(header_text)
+    headers = [item for item in items if item.text == normalized_header]
+    if foreground_bounds is not None:
+        headers = [
+            item
+            for item in headers
+            if point_is_inside_bounds(
+                [(item.left + item.right) // 2, (item.top + item.bottom) // 2],
+                foreground_bounds,
+            )
+        ]
+    if not headers:
+        return None
+
+    normalized_title = marker.normalize_ocr_text(table_title)
+    titles = [item for item in items if normalized_title and item.text == normalized_title]
+
+    scored: list[tuple[float, Any, list[Any]]] = []
+    for header in headers:
+        center_y = (header.top + header.bottom) // 2
+        tolerance = max(10, round(max(1, header.bottom - header.top) * 0.8))
+        row_items = [
+            item
+            for item in items
+            if abs((item.top + item.bottom) // 2 - center_y) <= tolerance
+            and (
+                foreground_bounds is None
+                or point_is_inside_bounds(
+                    [(item.left + item.right) // 2, (item.top + item.bottom) // 2],
+                    foreground_bounds,
+                )
+            )
+        ]
+        span = max((item.right for item in row_items), default=header.right) - min(
+            (item.left for item in row_items), default=header.left
+        )
+        score = len(row_items) * 1000.0 + span
+        if titles:
+            above = [
+                title
+                for title in titles
+                if title.bottom <= header.top and header.top - title.bottom <= 500
+            ]
+            if above:
+                score += 100000.0 - min(header.top - title.bottom for title in above)
+        scored.append((score, header, row_items))
+    _, header, row_items = max(scored, key=lambda value: value[0])
+    return header, row_items
+
+
+def run_visual_click_table_row(
+    context: ExecutionContext,
+    params: dict[str, Any],
+) -> dict[str, Any]:
+    """Click a data row using its table header, never a repeated cell value."""
+
+    row_number = int(params.get("row") or 1)
+    header_text = str(params.get("headerText") or "序号").strip()
+    table_title = str(params.get("tableTitle") or "").strip()
+    click_column = str(params.get("clickColumn") or "").strip()
+    if row_number < 1 or row_number > 100:
+        raise WorkflowExecutionError("表格行号必须在 1～100 之间")
+    if not header_text:
+        raise WorkflowExecutionError("表头定位文字不能为空")
+
+    window = current_window(context)
+    page = visual_page_id(params)
+    page_map = get_visual_page_map(
+        context,
+        window,
+        page,
+        prefer_changed_region=True,
+        target_key=f"table-row:{header_text}:{row_number}",
+    )
+    items = ensure_visual_ocr(context, window, page_map)
+    foreground_bounds = visual_foreground_bounds(page_map)
+    located = _find_table_header(items, header_text, table_title, foreground_bounds)
+    if located is None:
+        context.emit(
+            "info",
+            f"页面地图未找到表头“{header_text}”，刷新当前页面后再次识别",
+            None,
+        )
+        page_map = get_visual_page_map(
+            context,
+            window,
+            page,
+            force_new=True,
+            prefer_changed_region=True,
+            target_key=f"table-row:{header_text}:{row_number}",
+        )
+        items = ensure_visual_ocr(context, window, page_map)
+        foreground_bounds = visual_foreground_bounds(page_map)
+        located = _find_table_header(items, header_text, table_title, foreground_bounds)
+    if located is None:
+        raise WorkflowExecutionError(
+            f"完整 OCR 页面布局中仍未找到表头“{header_text}”，未执行点击"
+        )
+
+    header, header_row = located
+    detected_tables = visual_table_bounds(page_map)
+    header_center = [(header.left + header.right) // 2, (header.top + header.bottom) // 2]
+    table_bounds = next(
+        (bounds for bounds in detected_tables if point_is_inside_bounds(header_center, bounds)),
+        None,
     )
 
+    snapshot = page_map.get("currentSnapshot")
+    if not isinstance(snapshot, Image.Image):
+        snapshot = capture_visual_window(window)
+    header_left = min((item.left for item in header_row), default=header.left)
+    header_right = max((item.right for item in header_row), default=header.right)
+    header_top = min((item.top for item in header_row), default=header.top)
+    header_bottom = max((item.bottom for item in header_row), default=header.bottom)
+    if table_bounds is not None:
+        crop_left = max(0, table_bounds[0])
+        crop_right = min(snapshot.width, table_bounds[2])
+        table_bottom = table_bounds[3]
+    else:
+        crop_left = max(0, header_left - 16)
+        crop_right = min(snapshot.width, header_right + 16)
+        table_bottom = snapshot.height
+    crop_top = max(0, header_top - 12)
+    desired_height = max(140, 65 * (row_number + 1))
+    crop_bottom = min(snapshot.height, table_bottom, header_bottom + desired_height)
+    if foreground_bounds is not None:
+        crop_left = max(crop_left, foreground_bounds[0])
+        crop_top = max(crop_top, foreground_bounds[1])
+        crop_right = min(crop_right, foreground_bounds[2])
+        crop_bottom = min(crop_bottom, foreground_bounds[3])
+    ocr_bounds = [crop_left, crop_top, crop_right, crop_bottom]
+    local_items = local_visual_ocr(context, snapshot, ocr_bounds)
 
-def run_his_click_result(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
-    row = int(params.get("row", 1))
-    if row != 1:
-        raise WorkflowExecutionError("当前模块只支持点击第 1 条结果")
-    locator_mode = his.click_query_result(current_window(context))
-    return {"row": row, "locatorMode": locator_mode}
-
-
-def run_his_wait_navigation(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
-    timeout = float(params.get("timeoutSeconds", 30))
-    client = his.HisApiClient(his.HIS_URL)
-    client.post("/api/session/bootstrap")
-    projection = client.get("/api/view")
-    if his.normalize_text((projection.get("session") or {}).get("status")) != "active":
-        client.post("/api/command", {"type": "session.login"})
-    deadline = time.monotonic() + timeout
-    last_selected: dict[str, Any] | None = None
-    while time.monotonic() < deadline:
-        context.check_cancelled()
-        projection = client.get("/api/view")
-        selected = projection.get("selectedEncounter")
-        last_selected = selected if isinstance(selected, dict) else None
-        if (
-            last_selected is not None
-            and his.normalize_text(last_selected.get("hospitalizationNumber"))
-            == his.HOSPITALIZATION_NUMBER
-        ):
-            orders = projection.get("orders") or []
-            context.wait(0.8)
-            return {"orderCount": len(orders)}
-        context.wait(0.5)
-    raise WorkflowExecutionError(
-        f"{timeout:g} 秒内未进入住院号 {his.HOSPITALIZATION_NUMBER} 的医嘱页面；最后住院次={last_selected}"
+    local_header = _find_table_header(
+        local_items,
+        header_text,
+        "",
+        foreground_bounds,
     )
+    if local_header is not None:
+        live_header, live_header_row = local_header
+        header_bottom = max(
+            (item.bottom for item in live_header_row),
+            default=live_header.bottom,
+        )
+        header_row = live_header_row
+
+    minimum_data_y = header_bottom + 3
+    minimum_span = max(28, round((crop_right - crop_left) * 0.06))
+    data_rows: list[list[Any]] = []
+    for group in _ocr_row_groups(local_items, minimum_data_y):
+        span = max((item.right for item in group), default=0) - min(
+            (item.left for item in group), default=0
+        )
+        if len(group) >= 2 and span >= minimum_span:
+            data_rows.append(group)
+    if len(data_rows) < row_number:
+        raise WorkflowExecutionError(
+            f"表头“{header_text}”下方只识别到 {len(data_rows)} 条数据，无法点击第 {row_number} 行"
+        )
+
+    selected_row = data_rows[row_number - 1]
+    row_y = round(
+        sum((item.top + item.bottom) // 2 for item in selected_row)
+        / len(selected_row)
+    )
+    column_target = marker.normalize_ocr_text(click_column or header_text)
+    column_headers = [item for item in header_row if item.text == column_target]
+    column_header = min(
+        column_headers,
+        key=lambda item: abs((item.top + item.bottom) // 2 - (header.top + header.bottom) // 2),
+    ) if column_headers else header
+    click_x = (column_header.left + column_header.right) // 2
+    local_point = [click_x, row_y]
+    screen_point = local_point_to_screen(window, local_point)
+    mouse.click(button="left", coords=screen_point)
+    context.emit(
+        "info",
+        (
+            f"已点击表头“{header_text}”对应表格的第 {row_number} 行；"
+            "定位方式=页面地图+局部OCR"
+        ),
+        None,
+    )
+    return {
+        "row": row_number,
+        "headerText": header_text,
+        "tableTitle": table_title,
+        "clickColumn": click_column or header_text,
+        "recognizedCells": [item.raw_text for item in selected_row],
+        "locatorMode": "visual-map+local-ocr",
+        "ocrBounds": ocr_bounds,
+        "point": local_point,
+    }
 
 
 def safe_file_component(value: object) -> str:
@@ -2405,7 +2369,7 @@ def analyze_table_columns_width(
     if not rows:
         raise RuntimeError(f"OCR 未找到表格“{table_title}”的表头行")
 
-    # 表头是标题下方第一条包含多个文字框的水平行。这里不读取 DOM/UIA
+    # 表头是标题下方第一条包含多个文字框的水平行。这里不读取 DOM 或控件树
     # 中的完整值，后续所有判断都只使用截图里实际可见的 OCR 框。
     header_items = min(rows, key=lambda row: min(item.center_y for item in row))
     header_top = max(0, min(item.top for item in header_items) - 8)
@@ -2787,7 +2751,7 @@ def run_his_expand_table_column(
             else f".rpa_table_width_probe_{context.state['timestamp']}_{probe_serial:02d}.png"
         )
         probe_path = context.output_dir / probe_name
-        his.capture_his_window(window, probe_path)
+        window_adapter.capture_his_window(window, probe_path)
         if save_diagnostics:
             context.state["last_table_width_probe"] = probe_path
             context.emit(
@@ -3002,7 +2966,7 @@ def run_capture_current(context: ExecutionContext, params: dict[str, Any]) -> di
         or f"his_inpatient_{context.variables.get('hospitalization_number', 'unknown')}"
     )
     path = context.output_dir / f"{prefix}_current_{context.state['timestamp']}.png"
-    his.capture_his_window(current_window(context), path)
+    window_adapter.capture_his_window(current_window(context), path)
     context.state["current_screenshot"] = path
     context.state["screenshots"].append(path)
     context.emit("info", f"当前位置截图：{path}", {"path": str(path)})
@@ -3014,13 +2978,13 @@ def run_capture_rightmost(context: ExecutionContext, params: dict[str, Any]) -> 
     if not isinstance(current, Path) or not current.is_file():
         raise WorkflowExecutionError("请先执行“截取当前位置”模块")
     window = current_window(context)
-    scrollbar = his.detect_horizontal_scrollbar(window, current)
+    scrollbar = window_adapter.detect_horizontal_scrollbar(window, current)
     if scrollbar is None:
         context.emit("info", "未检测到横向滚动条，不生成最右端截图", None)
         return {"captured": False}
 
     original_position, rightmost_position = scrollbar
-    his.drag_scrollbar(original_position, rightmost_position)
+    window_adapter.drag_scrollbar(original_position, rightmost_position)
     prefix = safe_file_component(
         params.get("filePrefix")
         or f"his_inpatient_{context.variables.get('hospitalization_number', 'unknown')}"
@@ -3028,14 +2992,14 @@ def run_capture_rightmost(context: ExecutionContext, params: dict[str, Any]) -> 
     path = context.output_dir / f"{prefix}_rightmost_{context.state['timestamp']}.png"
     try:
         time.sleep(float(params.get("layoutWaitSeconds", 0.5)))
-        his.capture_his_window(window, path)
+        window_adapter.capture_his_window(window, path)
         context.state["screenshots"].append(path)
         context.emit("info", f"最右端截图：{path}", {"path": str(path)})
     finally:
         if bool(params.get("restorePosition", True)) and path.is_file():
-            right_state = his.detect_horizontal_scrollbar(window, path)
+            right_state = window_adapter.detect_horizontal_scrollbar(window, path)
             if right_state is not None:
-                his.drag_scrollbar(right_state[0], original_position)
+                window_adapter.drag_scrollbar(right_state[0], original_position)
                 time.sleep(0.35)
     return {"captured": True, "path": str(path)}
 
@@ -3067,14 +3031,14 @@ def run_his_expand_capture_full_table(
 
     context.check_cancelled()
     context.emit("info", "组合操作 [2/6]：截取当前位置", None)
-    his.capture_his_window(window, left_path)
+    window_adapter.capture_his_window(window, left_path)
     context.state["current_screenshot"] = left_path
     context.state["screenshots"].append(left_path)
     context.emit("info", f"当前位置截图：{left_path}", {"path": str(left_path)})
 
     context.check_cancelled()
     context.emit("info", "组合操作 [3/6]：检测横向滚动条并拖到最右端", None)
-    scrollbar = his.detect_horizontal_scrollbar(window, left_path)
+    scrollbar = window_adapter.detect_horizontal_scrollbar(window, left_path)
     if scrollbar is None:
         context.emit(
             "warning",
@@ -3094,7 +3058,7 @@ def run_his_expand_capture_full_table(
     restored_left = False
     right_expand_result: dict[str, Any] | None = None
     try:
-        his.drag_scrollbar(current_position, rightmost_position)
+        window_adapter.drag_scrollbar(current_position, rightmost_position)
         moved_right = True
         context.wait(scroll_wait_seconds)
 
@@ -3106,12 +3070,12 @@ def run_his_expand_capture_full_table(
         context.emit("info", "组合操作 [5/6]：截取最右侧当前位置", None)
         # 拓宽列会增加表格总宽度，因此先截图检测新的滑块范围；若产生了新的
         # 右侧空间，则继续拖到新的最右端，再覆盖保存最终截图。
-        his.capture_his_window(window, right_path)
-        right_state = his.detect_horizontal_scrollbar(window, right_path)
+        window_adapter.capture_his_window(window, right_path)
+        right_state = window_adapter.detect_horizontal_scrollbar(window, right_path)
         if right_state is not None and right_state[0] != right_state[1]:
-            his.drag_scrollbar(right_state[0], right_state[1])
+            window_adapter.drag_scrollbar(right_state[0], right_state[1])
             context.wait(scroll_wait_seconds)
-            his.capture_his_window(window, right_path)
+            window_adapter.capture_his_window(window, right_path)
         context.state["screenshots"].append(right_path)
         context.emit("info", f"最右端截图：{right_path}", {"path": str(right_path)})
     finally:
@@ -3122,19 +3086,19 @@ def run_his_expand_capture_full_table(
                 # 即使右侧拓宽阶段报错，也用第二张成品图判断滑块位置并复位；
                 # 不额外留下恢复用或 OCR 诊断截图。
                 try:
-                    his.capture_his_window(window, right_path)
+                    window_adapter.capture_his_window(window, right_path)
                     restore_source = right_path
                 except Exception:
                     restore_source = None
             restore_state = (
-                his.detect_horizontal_scrollbar(window, restore_source)
+                window_adapter.detect_horizontal_scrollbar(window, restore_source)
                 if restore_source is not None
                 else None
             )
             if restore_state is not None:
                 rect = window.rectangle()
                 leftmost_position = (rect.left + 1, restore_state[0][1])
-                his.drag_scrollbar(restore_state[0], leftmost_position)
+                window_adapter.drag_scrollbar(restore_state[0], leftmost_position)
                 time.sleep(0.35)
                 restored_left = True
                 context.emit("info", "横向滚动条已恢复到最左端", None)
@@ -3368,7 +3332,7 @@ def date_segment_local_points(
 
 
 def run_his_input_date(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
-    """Fill a visually located segmented date control without relying on UIA."""
+    """Fill a segmented date control located entirely from the visual map."""
 
     field_name = str(params.get("fieldName") or "").strip()
     date_value = str(params.get("dateValue") or "").strip()
@@ -3597,7 +3561,6 @@ def run_visual_hover_object(
     target_name = str(params.get("targetName") or "").strip()
     if not target_name:
         raise WorkflowExecutionError("悬浮对象名称不能为空")
-    timeout = float(params.get("timeoutSeconds", 5))
     wait_seconds = float(params.get("hoverWaitSeconds", 0.5))
     if not 0 <= wait_seconds <= 10:
         raise WorkflowExecutionError("悬浮后等待时间必须在 0～10 秒之间")
@@ -3614,17 +3577,25 @@ def run_visual_hover_object(
         page=source_page,
         role="hover-trigger",
     )
-    if point is not None:
-        locator_mode = "visual-map"
-    else:
-        control = find_named_his_control(window, target_name, None, timeout)
-        if control is None:
-            raise WorkflowExecutionError(
-                f"无法在视觉页面布局或 UIA 中找到悬浮对象“{target_name}”"
-            )
-        rect = control.rectangle()
-        point = (rect.left + rect.width() // 2, rect.top + rect.height() // 2)
-        locator_mode = "uia-control"
+    if point is None:
+        context.emit(
+            "info",
+            f"视觉地图未找到悬浮对象“{target_name}”，刷新当前页面后再次视觉识别",
+            None,
+        )
+        point = visual_text_point(
+            context,
+            window,
+            target_name,
+            page=source_page,
+            role="hover-trigger",
+            force_new=True,
+        )
+    if point is None:
+        raise WorkflowExecutionError(
+            f"完整 OCR 页面布局中仍未找到悬浮对象“{target_name}”，未执行悬浮"
+        )
+    locator_mode = "visual-map"
     mouse.move(coords=point)
     context.wait(wait_seconds)
     hover_map = get_visual_page_map(
@@ -3659,36 +3630,6 @@ def run_keyboard(context: ExecutionContext, params: dict[str, Any]) -> dict[str,
     current_window(context).set_focus()
     send_keys(keys, pause=float(params.get("pauseSeconds", 0.08)))
     return {"keys": keys}
-
-
-def run_relative_click(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
-    x_ratio = float(params.get("xRatio", 0.5))
-    y_ratio = float(params.get("yRatio", 0.5))
-    if not 0 <= x_ratio <= 1 or not 0 <= y_ratio <= 1:
-        raise WorkflowExecutionError("相对坐标必须在 0～1 之间")
-    window = current_window(context)
-    rect = window.rectangle()
-    x = round(rect.left + (rect.right - rect.left) * x_ratio)
-    y = round(rect.top + (rect.bottom - rect.top) * y_ratio)
-    mouse.click(button=str(params.get("button") or "left"), coords=(x, y))
-    return {"point": [x, y]}
-
-
-def run_uia_click(context: ExecutionContext, params: dict[str, Any]) -> dict[str, Any]:
-    name = str(params.get("name") or "").strip()
-    control_type = str(params.get("controlType") or "Button").strip()
-    timeout = float(params.get("timeoutSeconds", 5))
-    if not name:
-        raise WorkflowExecutionError("控件名称不能为空")
-    window = current_window(context)
-    control = window.child_window(
-        title=name,
-        control_type=control_type,
-    )
-    if not control.exists(timeout=timeout):
-        raise WorkflowExecutionError(f"未找到控件：{name} / {control_type}")
-    control.wrapper_object().click_input()
-    return {"name": name, "controlType": control_type}
 
 
 def build_registry() -> WorkflowRegistry:
@@ -3743,7 +3684,6 @@ def build_registry() -> WorkflowRegistry:
                 visual_page_field(),
                 field("hoverPage", "展开状态页面标识", "text", ""),
                 field("hoverWaitSeconds", "悬浮后等待（秒）", "number", 0.5, min=0, max=10, step=0.1),
-                field("timeoutSeconds", "UIA 查找超时（秒）", "number", 5, min=0, max=60, step=1),
             ),
             run_visual_hover_object,
         ),
@@ -3763,23 +3703,22 @@ def build_registry() -> WorkflowRegistry:
             run_visual_ensure_expanded,
         ),
         ModuleDefinition(
-            "his.input_field",
-            "填写 HIS 字段并回车",
-            "HIS",
+            "visual.input_field",
+            "填写文本字段",
+            "视觉",
             "通过 OCR 页面布局定位并填写普通文本字段。",
             (
                 field("fieldName", "目标字段名称", "text", "卡号"),
                 field("value", "填写内容/变量", "text", ""),
                 field("pressEnter", "填写后按回车", "boolean", True),
                 visual_page_field(),
-                field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
             ),
             run_his_input_field,
         ),
         ModuleDefinition(
-            "his.input_date",
-            "HIS 填写日期",
-            "HIS",
+            "visual.input_date",
+            "填写日期",
+            "视觉",
             "通过 OCR 页面布局定位日期框；点击首个日期段后，用右方向键依次切换并填写各段。",
             (
                 field("fieldName", "日期字段名称", "text", "开始日期"),
@@ -3812,22 +3751,21 @@ def build_registry() -> WorkflowRegistry:
             run_his_input_date,
         ),
         ModuleDefinition(
-            "his.select_option",
-            "HIS 选择下拉项",
-            "HIS",
-            "字段名称和目标选项均可配置；优先按 ComboBox 控件定位。",
+            "visual.select_option",
+            "选择下拉项",
+            "视觉",
+            "通过 OCR 页面布局定位下拉框和展开后的目标选项。",
             (
                 field("fieldName", "下拉框字段名称", "text", "性别"),
                 field("optionText", "选择内容/变量", "text", "全部"),
                 visual_page_field(),
-                field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
             ),
             run_his_select_option,
         ),
         ModuleDefinition(
-            "his.set_checkbox",
-            "HIS 设置勾选框",
-            "HIS",
+            "visual.set_checkbox",
+            "设置勾选框",
+            "视觉",
             "按名称设置勾选或取消勾选；执行前读取当前状态，避免错误反选。",
             (
                 field("checkboxName", "勾选框名称", "text", "出院患者"),
@@ -3839,33 +3777,16 @@ def build_registry() -> WorkflowRegistry:
                     options=["勾选", "取消勾选", "切换"],
                 ),
                 visual_page_field(),
-                field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
             ),
             run_his_set_checkbox,
         ),
         ModuleDefinition(
-            "his.click_object",
-            "HIS 点击对象",
-            "HIS",
-            "点击对象名称可配置，例如查询、清屏、导出、打印或其他 UIA 控件。",
+            "visual.click_object",
+            "点击文字对象",
+            "视觉",
+            "通过 OCR 页面布局点击查询、清屏、导出、打印等可见文字对象。",
             (
                 field("targetName", "点击对象名称", "text", "查询"),
-                field(
-                    "controlType",
-                    "控件类型",
-                    "select",
-                    "自动",
-                    options=[
-                        "自动",
-                        "Button",
-                        "Hyperlink",
-                        "TabItem",
-                        "MenuItem",
-                        "Text",
-                        "DataItem",
-                        "ListItem",
-                    ],
-                ),
                 field(
                     "matchMode",
                     "名称匹配方式",
@@ -3874,49 +3795,27 @@ def build_registry() -> WorkflowRegistry:
                     options=["精确匹配", "包含文字"],
                 ),
                 visual_page_field(),
-                field("timeoutSeconds", "控件查找超时（秒）", "number", 5, min=0, max=60, step=1),
             ),
             run_his_click_object,
         ),
         ModuleDefinition(
-            "his.input_hospitalization",
-            "填写住院号并回车",
-            "HIS",
-            "优先使用 UIA，失败时沿用已验证的相对布局定位。",
+            "visual.click_table_row",
+            "点击表格行",
+            "视觉",
+            "通过表头识别表格，并用快速局部 OCR 点击指定数据行；不依赖行内重复文字。",
             (
-                field("value", "住院号/变量", "text", "${hospitalization_number}"),
+                field("tableTitle", "表格标题（可选）", "text", ""),
+                field("headerText", "表头定位文字", "text", "序号"),
+                field("row", "数据行号", "number", 1, min=1, max=100, step=1),
+                field("clickColumn", "点击列名（留空使用定位表头）", "text", ""),
                 visual_page_field(),
             ),
-            run_his_input_number,
+            run_visual_click_table_row,
         ),
         ModuleDefinition(
-            "his.wait_query",
-            "等待患者查询结果",
-            "HIS",
-            "等待页面确认住院号查询已经完成。",
-            (field("timeoutSeconds", "超时（秒）", "number", 30, min=1, max=180, step=1),),
-            run_his_wait_query,
-        ),
-        ModuleDefinition(
-            "his.click_first_result",
-            "点击查询结果",
-            "HIS",
-            "点击患者查询表中的第一条结果。",
-            (field("row", "结果序号", "number", 1, min=1, max=1, step=1),),
-            run_his_click_result,
-        ),
-        ModuleDefinition(
-            "his.wait_navigation",
-            "等待医嘱页面",
-            "HIS",
-            "确认已经进入目标住院次的医嘱费用查询页面。",
-            (field("timeoutSeconds", "超时（秒）", "number", 30, min=1, max=180, step=1),),
-            run_his_wait_navigation,
-        ),
-        ModuleDefinition(
-            "his.expand_table_column",
+            "visual.expand_table_column",
             "自动拓宽显示不全的列",
-            "HIS",
+            "视觉",
             "OCR 扫描大表所有可见列，检测被右边界截断的值并拖动对应列分隔线。",
             (
                 field("tableTitle", "表格标题/定位文字", "text", "医嘱明细"),
@@ -3934,13 +3833,13 @@ def build_registry() -> WorkflowRegistry:
             run_his_expand_table_column,
         ),
         ModuleDefinition(
-            "his.expand_capture_full_table",
+            "visual.expand_capture_full_table",
             "拓宽并截取完整表格",
-            "HIS",
+            "视觉",
             "依次拓宽左侧可见列、截图、滚到最右侧、拓宽右侧可见列、截图并恢复到最左侧。",
             (
                 field("tableTitle", "表格标题/定位文字", "text", "医嘱明细"),
-                field("filePrefix", "截图文件名前缀", "text", "his_inpatient_${hospitalization_number}"),
+                field("filePrefix", "截图文件名前缀", "text", "table_${hospitalization_number}"),
                 field("expandPixels", "每次向右拓宽（像素）", "number", 80, min=10, max=500, step=10),
                 field("maxExpandPixels", "每列最大拓宽（像素）", "number", 320, min=10, max=1200, step=10),
                 field("edgeMarginPixels", "OCR 文字贴近右边界距离（像素）", "number", 12, min=1, max=40, step=1),
@@ -3959,8 +3858,8 @@ def build_registry() -> WorkflowRegistry:
             "capture.current",
             "截取当前位置",
             "截图",
-            "截取当前 HIS 窗口并记录为 OCR 输入。",
-            (field("filePrefix", "文件名前缀", "text", "his_inpatient_${hospitalization_number}"),),
+            "截取当前目标窗口并记录为 OCR 输入。",
+            (field("filePrefix", "文件名前缀", "text", "capture_${hospitalization_number}"),),
             run_capture_current,
         ),
         ModuleDefinition(
@@ -3969,7 +3868,7 @@ def build_registry() -> WorkflowRegistry:
             "截图",
             "检测横向滚动条，拖到最右端截图并恢复。",
             (
-                field("filePrefix", "文件名前缀", "text", "his_inpatient_${hospitalization_number}"),
+                field("filePrefix", "文件名前缀", "text", "capture_${hospitalization_number}"),
                 field("restorePosition", "截图后恢复", "boolean", True),
                 field("layoutWaitSeconds", "滚动后等待（秒）", "number", 0.5, min=0, max=10, step=0.1),
             ),
@@ -4047,31 +3946,69 @@ def build_registry() -> WorkflowRegistry:
             ),
             run_keyboard,
         ),
-        ModuleDefinition(
-            "mouse.click_relative",
-            "按窗口比例点击",
-            "高级（可选）",
-            "按目标窗口宽高比例点击，作为控件定位的兜底方式。",
-            (
-                field("xRatio", "横向比例", "number", 0.5, min=0, max=1, step=0.01),
-                field("yRatio", "纵向比例", "number", 0.5, min=0, max=1, step=0.01),
-                field("button", "鼠标键", "select", "left", options=["left", "right"]),
-            ),
-            run_relative_click,
-        ),
-        ModuleDefinition(
-            "uia.click",
-            "点击 UIA 控件",
-            "高级（可选）",
-            "按控件名称与类型定位并点击。",
-            (
-                field("name", "控件名称", "text", ""),
-                field("controlType", "控件类型", "text", "Button"),
-                field("timeoutSeconds", "超时（秒）", "number", 5, min=1, max=60, step=1),
-            ),
-            run_uia_click,
-        ),
     ]
     for definition in definitions:
+        registry.register(definition)
+
+    # Existing saved workflows from earlier releases keep working, but these
+    # application-specific type names are no longer shown in the module panel.
+    legacy_aliases = {
+        "his.input_field": "visual.input_field",
+        "his.input_date": "visual.input_date",
+        "his.select_option": "visual.select_option",
+        "his.set_checkbox": "visual.set_checkbox",
+        "his.click_object": "visual.click_object",
+        "his.click_first_result": "visual.click_table_row",
+        "his.expand_table_column": "visual.expand_table_column",
+        "his.expand_capture_full_table": "visual.expand_capture_full_table",
+    }
+    for legacy_type, current_type in legacy_aliases.items():
+        current = registry.get(current_type)
+        registry.register(
+            ModuleDefinition(
+                legacy_type,
+                current.name,
+                current.category,
+                current.description,
+                current.fields,
+                current.handler,
+                hidden=True,
+            )
+        )
+
+    # Compatibility only for old demo configurations. New workflows use the
+    # generic OCR modules above and never receive these entries from the API.
+    for definition in (
+        ModuleDefinition(
+            "his.input_hospitalization",
+            "填写住院号并回车",
+            "视觉",
+            "旧流程兼容模块。",
+            (
+                field("value", "住院号/变量", "text", "${hospitalization_number}"),
+                visual_page_field(),
+            ),
+            run_his_input_number,
+            hidden=True,
+        ),
+        ModuleDefinition(
+            "his.wait_query",
+            "等待患者查询结果",
+            "高级（兼容）",
+            "旧流程兼容模块。",
+            (field("timeoutSeconds", "超时（秒）", "number", 30, min=1, max=180, step=1),),
+            run_wait,
+            hidden=True,
+        ),
+        ModuleDefinition(
+            "his.wait_navigation",
+            "等待页面跳转",
+            "高级（兼容）",
+            "旧流程兼容模块。",
+            (field("timeoutSeconds", "超时（秒）", "number", 30, min=1, max=180, step=1),),
+            run_wait,
+            hidden=True,
+        ),
+    ):
         registry.register(definition)
     return registry
