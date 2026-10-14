@@ -187,6 +187,30 @@ class VisualShapeDetectionTests(unittest.TestCase):
         self.assertGreaterEqual(right, 469)
         self.assertGreaterEqual(bottom, 249)
 
+    def test_detects_empty_table_header_without_data_rows(self) -> None:
+        image = Image.new("RGB", (900, 320), "white")
+        draw = ImageDraw.Draw(image)
+        column_lines = (20, 120, 220, 320, 420, 520, 620, 720, 880)
+        for x in column_lines:
+            draw.line((x, 180, x, 220), fill=(160, 170, 180), width=2)
+        for y in (180, 220):
+            draw.line((20, y, 880, y), fill=(160, 170, 180), width=2)
+
+        tables = detect_table_regions(image)
+
+        self.assertEqual(len(tables), 1)
+        self.assertTrue(tables[0]["headerOnly"])
+
+    def test_navigation_bar_is_not_an_empty_table(self) -> None:
+        image = Image.new("RGB", (900, 320), "white")
+        draw = ImageDraw.Draw(image)
+        for x in (20, 120, 220, 320, 420, 520, 620, 720, 880):
+            draw.line((x, 20, x, 48), fill=(20, 120, 190), width=2)
+        for y in (20, 34, 48):
+            draw.line((20, y, 880, y), fill=(20, 120, 190), width=2)
+
+        self.assertEqual(detect_table_regions(image), [])
+
     def test_detects_control_candidates_once_and_associates_labels(self) -> None:
         image = Image.new("RGB", (460, 190), (238, 242, 246))
         draw = ImageDraw.Draw(image)

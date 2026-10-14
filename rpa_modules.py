@@ -6,6 +6,7 @@ import ctypes
 import datetime
 import hashlib
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -150,18 +151,87 @@ def visual_window_signature(
     }
 
 
-def visual_map_path(signature: dict[str, Any]) -> Path:
+def legacy_visual_map_path(signature: dict[str, Any]) -> Path:
     identity = json.dumps(signature, ensure_ascii=False, sort_keys=True)
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
     return VISUAL_MAP_ROOT / f"page-{digest}" / "layout.json"
+
+
+def visual_map_name_part(value: Any, fallback: str, limit: int) -> str:
+    text = str(value or "").strip()
+    if not text:
+        text = fallback
+    if text == "current-page":
+        text = "当前页面"
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", text)
+    text = re.sub(r"\s+", "-", text).strip(" .-_")
+    return (text or fallback)[:limit].rstrip(" .-_") or fallback
+
+
+def visual_map_path(signature: dict[str, Any]) -> Path:
+    identity = json.dumps(signature, ensure_ascii=False, sort_keys=True)
+    digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:8]
+    page = visual_map_name_part(signature.get("page"), "当前页面", 28)
+    window = visual_map_name_part(signature.get("windowTitle"), "目标窗口", 36)
+    fingerprint = visual_map_name_part(
+        signature.get("stateFingerprint"),
+        "待识别",
+        12,
+    )
+    folder = f"页面-{page}__窗口-{window}__状态-{fingerprint}__配置-{digest}"
+    return VISUAL_MAP_ROOT / folder / "layout.json"
+
+
+def existing_visual_map_path(
+    signature: dict[str, Any],
+    migrate_legacy: bool = True,
+) -> Path:
+    path = visual_map_path(signature)
+    if path.is_file():
+        return path
+    legacy = legacy_visual_map_path(signature)
+    if not legacy.is_file():
+        return path
+    if migrate_legacy:
+        try:
+            path.parent.parent.mkdir(parents=True, exist_ok=True)
+            legacy.parent.rename(path.parent)
+            return path
+        except OSError:
+            pass
+    return legacy
 
 
 def visual_reference_path(signature: dict[str, Any]) -> Path:
     return visual_map_path(signature).with_name("reference.png")
 
 
+def existing_visual_reference_path(signature: dict[str, Any]) -> Path:
+    return existing_visual_map_path(signature).with_name("reference.png")
+
+
+def visual_map_label(page_map: Any) -> str:
+    if not isinstance(page_map, dict) or not isinstance(page_map.get("signature"), dict):
+        return "Map=未知（尚未建立页面地图）"
+    signature = page_map["signature"]
+    layout_path = existing_visual_map_path(signature)
+    reference_path = existing_visual_reference_path(signature)
+    event = page_map.get("stateEvent")
+    source = "复用" if event == "reused" else "新建" if event == "created" else "已加载"
+    fingerprint = str(signature.get("stateFingerprint") or "未知")
+    page = str(signature.get("page") or "current-page")
+    distance = page_map.get("stateDistance")
+    distance_text = ""
+    if isinstance(distance, (int, float)):
+        distance_text = f"，相似度距离={float(distance):.4f}"
+    return (
+        f"Map={layout_path.parent.name}，页面={page}，状态指纹={fingerprint}，"
+        f"来源={source}{distance_text}，布局={layout_path}，参考图={reference_path}"
+    )
+
+
 def load_visual_targets(signature: dict[str, Any]) -> dict[str, list[int]]:
-    path = visual_map_path(signature)
+    path = existing_visual_map_path(signature)
     if not path.is_file():
         return {}
     try:
@@ -185,6 +255,7 @@ def load_visual_targets(signature: dict[str, Any]) -> dict[str, list[int]]:
 
 
 def save_visual_targets(page_map: dict[str, Any]) -> None:
+    existing_visual_map_path(page_map["signature"])
     path = visual_map_path(page_map["signature"])
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".json.tmp")
@@ -240,7 +311,7 @@ def save_visual_targets(page_map: dict[str, Any]) -> None:
 
 
 def load_visual_model(signature: dict[str, Any]) -> dict[str, Any]:
-    path = visual_map_path(signature)
+    path = existing_visual_map_path(signature)
     if not path.is_file():
         return {}
     try:
@@ -313,7 +384,7 @@ def build_ocr_relationships(items: list[Any]) -> list[dict[str, Any]]:
     return relationships
 
 
-VISUAL_CLASSIFICATION_VERSION = 7
+VISUAL_CLASSIFICATION_VERSION = 9
 VISUAL_CHECKBOX_LOCATOR_VERSION = 4
 
 
@@ -871,7 +942,7 @@ def persisted_page_candidates(expected: dict[str, Any]) -> list[dict[str, Any]]:
     if not VISUAL_MAP_ROOT.is_dir():
         return candidates
     paths = sorted(
-        VISUAL_MAP_ROOT.glob("page-*/layout.json"),
+        VISUAL_MAP_ROOT.glob("*/layout.json"),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
@@ -903,7 +974,7 @@ def visual_page_image(page_map: dict[str, Any]) -> Image.Image | None:
     signature = page_map.get("signature")
     if not isinstance(signature, dict):
         return None
-    reference_path = visual_reference_path(signature)
+    reference_path = existing_visual_reference_path(signature)
     if not reference_path.is_file():
         return None
     try:
@@ -927,7 +998,7 @@ def mapped_foreground_bounds(page_map: dict[str, Any]) -> list[int] | None:
     if not isinstance(image, Image.Image):
         signature = page_map.get("signature")
         if isinstance(signature, dict):
-            reference = visual_reference_path(signature)
+            reference = existing_visual_reference_path(signature)
             if reference.is_file():
                 try:
                     with Image.open(reference) as stored:
@@ -978,7 +1049,7 @@ def announce_visual_state(
             message = f"检测到新的页面结构，将建立独立 Map；状态={fingerprint}"
     else:
         message = f"已匹配并复用页面 Map；状态={fingerprint}"
-    context.emit("info", message, None)
+    context.emit("info", f"{message}；{visual_map_label(page_map)}", None)
 
 
 def get_visual_page_map(
@@ -1189,7 +1260,7 @@ def ensure_visual_ocr(
 
     persisted_raw = page_map.get("persistedRawOcr")
     persisted_raw_weak = page_map.get("persistedRawWeakOcr")
-    reference_path = visual_reference_path(page_map["signature"])
+    reference_path = existing_visual_reference_path(page_map["signature"])
     if isinstance(persisted_raw, list) and persisted_raw and reference_path.is_file():
         restored = restore_ocr(persisted_raw)
         if restored:
@@ -1803,6 +1874,7 @@ def visual_input_point(
         prefer_changed_region=True,
         target_key=target_key,
     )
+    context.state["last_visual_resolved_map"] = page_map
     foreground_bounds = visual_foreground_bounds(page_map)
     table_bounds = visual_table_bounds(page_map)
     cached = page_map["targets"].get(target_key)
@@ -2010,6 +2082,7 @@ def visual_select_point(
         prefer_changed_region=True,
         target_key=target_key,
     )
+    context.state["last_visual_resolved_map"] = page_map
     foreground_bounds = visual_foreground_bounds(page_map)
     table_bounds = visual_table_bounds(page_map)
     cached = page_map["targets"].get(target_key)
@@ -2142,6 +2215,7 @@ def visual_checkbox_point(
         prefer_changed_region=True,
         target_key=target_key,
     )
+    context.state["last_visual_resolved_map"] = page_map
     foreground_bounds = visual_foreground_bounds(page_map)
     table_bounds = visual_table_bounds(page_map)
     cached = page_map["targets"].get(target_key)
@@ -2314,7 +2388,7 @@ def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> di
     if point is None:
         context.emit(
             "info",
-            f"视觉地图未找到字段“{field_name}”，刷新当前页面后再次视觉识别",
+            f"视觉地图未找到字段“{field_name}”，刷新当前页面后再次视觉识别；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
             None,
         )
         point = visual_input_point(
@@ -2326,7 +2400,7 @@ def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> di
         )
     if point is None:
         raise WorkflowExecutionError(
-            f"完整 OCR 页面布局中仍未找到字段“{field_name}”，未执行输入"
+            f"完整 OCR 页面布局中仍未找到字段“{field_name}”，未执行输入；{visual_map_label(context.state.get('last_visual_resolved_map'))}"
         )
     mouse.click(button="left", coords=point)
     locator_mode = "visual-map"
@@ -2341,7 +2415,7 @@ def run_his_input_field(context: ExecutionContext, params: dict[str, Any]) -> di
     remember_visual_action(context, point, "input")
     context.emit(
         "info",
-        f"已填写字段“{field_name}”{('并按回车' if submit else '')}；定位方式={locator_mode}",
+        f"已填写字段“{field_name}”{('并按回车' if submit else '')}；定位方式={locator_mode}；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
         None,
     )
     return {
@@ -2374,7 +2448,7 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
     if point is None:
         context.emit(
             "info",
-            f"视觉地图未找到下拉框“{field_name}”，刷新当前页面后再次视觉识别",
+            f"视觉地图未找到下拉框“{field_name}”，刷新当前页面后再次视觉识别；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
             None,
         )
         point = visual_select_point(
@@ -2386,7 +2460,7 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
         )
     if point is None:
         raise WorkflowExecutionError(
-            f"完整 OCR 页面布局中仍未找到下拉框“{field_name}”，未执行选择"
+            f"完整 OCR 页面布局中仍未找到下拉框“{field_name}”，未执行选择；{visual_map_label(context.state.get('last_visual_resolved_map'))}"
         )
     mouse.click(button="left", coords=point)
     context.wait(0.25)
@@ -2403,7 +2477,7 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
     if option_point is None:
         context.emit(
             "info",
-            f"视觉地图未找到下拉项“{option_text}”，刷新展开状态后再次视觉识别",
+            f"视觉地图未找到下拉项“{option_text}”，刷新展开状态后再次视觉识别；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
             None,
         )
         option_point = visual_text_point(
@@ -2418,7 +2492,7 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
         )
     if option_point is None:
         raise WorkflowExecutionError(
-            f"OCR 未识别到下拉项“{option_text}”，未执行选择"
+            f"OCR 未识别到下拉项“{option_text}”，未执行选择；{visual_map_label(context.state.get('last_visual_resolved_map'))}"
         )
     mouse.click(button="left", coords=option_point)
     locator_mode = "visual-map"
@@ -2426,7 +2500,7 @@ def run_his_select_option(context: ExecutionContext, params: dict[str, Any]) -> 
 
     context.emit(
         "info",
-        f"已在下拉框“{field_name}”选择“{option_text}”；定位方式={locator_mode}",
+        f"已在下拉框“{field_name}”选择“{option_text}”；定位方式={locator_mode}；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
         None,
     )
     return {
@@ -2456,7 +2530,7 @@ def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> d
     if point is None:
         context.emit(
             "info",
-            f"视觉地图未找到勾选框“{checkbox_name}”，刷新当前页面后再次视觉识别",
+            f"视觉地图未找到勾选框“{checkbox_name}”，刷新当前页面后再次视觉识别；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
             None,
         )
         point = visual_checkbox_point(
@@ -2468,7 +2542,7 @@ def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> d
         )
     if point is None:
         raise WorkflowExecutionError(
-            f"完整 OCR 页面布局中仍未找到勾选框“{checkbox_name}”，未执行操作"
+            f"完整 OCR 页面布局中仍未找到勾选框“{checkbox_name}”，未执行操作；{visual_map_label(context.state.get('last_visual_resolved_map'))}"
         )
     locator_mode = "visual-map"
     current_state = visual_checkbox_state(point)
@@ -2483,7 +2557,7 @@ def run_his_set_checkbox(context: ExecutionContext, params: dict[str, Any]) -> d
     remember_visual_action(context, point, "checkbox")
     context.emit(
         "info",
-        f"勾选框“{checkbox_name}”已设为{('勾选' if final_state else '未勾选')}；定位方式={locator_mode}",
+        f"勾选框“{checkbox_name}”已设为{('勾选' if final_state else '未勾选')}；定位方式={locator_mode}；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
         None,
     )
     return {
@@ -2517,7 +2591,7 @@ def run_his_click_object(context: ExecutionContext, params: dict[str, Any]) -> d
     if point is None:
         context.emit(
             "info",
-            f"视觉地图未找到对象“{target_name}”，刷新当前页面后再次视觉识别",
+            f"视觉地图未找到对象“{target_name}”，刷新当前页面后再次视觉识别；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
             None,
         )
         point = visual_text_point(
@@ -2530,7 +2604,7 @@ def run_his_click_object(context: ExecutionContext, params: dict[str, Any]) -> d
         )
     if point is None:
         raise WorkflowExecutionError(
-            f"完整 OCR 页面布局中仍未找到对象“{target_name}”，未执行点击"
+            f"完整 OCR 页面布局中仍未找到对象“{target_name}”，未执行点击；{visual_map_label(context.state.get('last_visual_resolved_map'))}"
         )
     mouse.click(button="left", coords=point)
     locator_mode = "visual-map"
@@ -2553,7 +2627,7 @@ def run_his_click_object(context: ExecutionContext, params: dict[str, Any]) -> d
 
     context.emit(
         "info",
-        f"已点击对象“{target_name}”；定位方式={locator_mode}",
+        f"已点击对象“{target_name}”；定位方式={locator_mode}；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
         None,
     )
     return {
@@ -2582,7 +2656,7 @@ def run_his_input_number(context: ExecutionContext, params: dict[str, Any]) -> d
     if point is None:
         context.emit(
             "info",
-            "视觉地图未找到住院号输入框，刷新当前页面后再次视觉识别",
+            f"视觉地图未找到住院号输入框，刷新当前页面后再次视觉识别；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
             None,
         )
         point = visual_input_point(
@@ -2594,7 +2668,7 @@ def run_his_input_number(context: ExecutionContext, params: dict[str, Any]) -> d
         )
     if point is None:
         raise WorkflowExecutionError(
-            "完整 OCR 页面布局中仍未找到住院号输入框，未执行输入"
+            f"完整 OCR 页面布局中仍未找到住院号输入框，未执行输入；{visual_map_label(context.state.get('last_visual_resolved_map'))}"
         )
     mouse.click(button="left", coords=point)
     locator_mode = "visual-map"
@@ -2607,7 +2681,7 @@ def run_his_input_number(context: ExecutionContext, params: dict[str, Any]) -> d
     send_keys("{ENTER}", pause=0.08)
     context.emit(
         "info",
-        f"已填写住院号并按回车；定位方式={locator_mode}",
+        f"已填写住院号并按回车；定位方式={locator_mode}；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
         None,
     )
     return {"value": number, "locatorMode": locator_mode, "point": list(point)}
@@ -2735,7 +2809,7 @@ def run_visual_click_table_row(
     if located is None:
         context.emit(
             "info",
-            f"页面地图未找到表头“{header_text}”，刷新当前页面后再次识别",
+            f"页面地图未找到表头“{header_text}”，刷新当前页面后再次识别；{visual_map_label(page_map)}",
             None,
         )
         page_map = get_visual_page_map(
@@ -2751,7 +2825,7 @@ def run_visual_click_table_row(
         located = _find_table_header(items, header_text, table_title, foreground_bounds)
     if located is None:
         raise WorkflowExecutionError(
-            f"完整 OCR 页面布局中仍未找到表头“{header_text}”，未执行点击"
+            f"完整 OCR 页面布局中仍未找到表头“{header_text}”，未执行点击；{visual_map_label(page_map)}"
         )
 
     header, header_row = located
@@ -2836,7 +2910,7 @@ def run_visual_click_table_row(
         "info",
         (
             f"已点击表头“{header_text}”对应表格的第 {row_number} 行；"
-            "定位方式=页面地图+局部OCR"
+            f"定位方式=页面地图+局部OCR；{visual_map_label(page_map)}"
         ),
         None,
     )
@@ -3815,6 +3889,7 @@ def run_visual_map_page(
         "stateFingerprint": page_map["signature"].get("stateFingerprint"),
         "stateEvent": page_map.get("stateEvent"),
         "stateDistance": page_map.get("stateDistance"),
+        "mapLabel": visual_map_label(page_map),
         "recognitionScope": "local-change" if page_map.get("ocrBounds") else "full-window",
         "layoutPath": str(path),
         "textCount": len(items),
@@ -3957,7 +4032,7 @@ def run_his_input_date(context: ExecutionContext, params: dict[str, Any]) -> dic
     if point is None:
         context.emit(
             "info",
-            f"视觉地图未找到日期字段“{field_name}”，刷新当前页面后再次视觉识别",
+            f"视觉地图未找到日期字段“{field_name}”，刷新当前页面后再次视觉识别；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
             None,
         )
         point = visual_input_point(
@@ -3969,7 +4044,7 @@ def run_his_input_date(context: ExecutionContext, params: dict[str, Any]) -> dic
         )
     if point is None:
         raise WorkflowExecutionError(
-            f"视觉页面布局中未找到日期字段“{field_name}”"
+            f"视觉页面布局中未找到日期字段“{field_name}”；{visual_map_label(context.state.get('last_visual_resolved_map'))}"
         )
 
     page_map = get_visual_page_map(context, window, page)
@@ -3981,7 +4056,7 @@ def run_his_input_date(context: ExecutionContext, params: dict[str, Any]) -> dic
         and all(isinstance(value, int) for value in bounds)
     ):
         raise WorkflowExecutionError(
-            f"日期字段“{field_name}”已有中心坐标，但布局中缺少输入框边界；请强制重新识别页面布局"
+            f"日期字段“{field_name}”已有中心坐标，但布局中缺少输入框边界；请强制重新识别页面布局；{visual_map_label(context.state.get('last_visual_resolved_map'))}"
         )
 
     order = infer_date_order(page_map, bounds) if requested_order == "自动识别" else requested_order
@@ -4018,7 +4093,7 @@ def run_his_input_date(context: ExecutionContext, params: dict[str, Any]) -> dic
         "info",
         (
             f"已填写日期字段“{field_name}”={date_value}；分段顺序={order}；"
-            "切换方式=右方向键；定位方式=visual-map"
+            f"切换方式=右方向键；定位方式=visual-map；{visual_map_label(context.state.get('last_visual_resolved_map'))}"
         ),
         None,
     )
@@ -4096,7 +4171,7 @@ def run_visual_set_expand_state(
             anchors.append(anchor)
     if not anchors:
         raise WorkflowExecutionError(
-            "已有页面 Map 中未找到展开/收起状态文字，无法确定局部 OCR 区域；请先建立当前页面布局"
+            f"已有页面 Map 中未找到展开/收起状态文字，无法确定局部 OCR 区域；请先建立当前页面布局；{visual_map_label(candidates[0] if candidates else None)}"
         )
 
     desired_text = expanded_text if target_state == "展开" else collapsed_text
@@ -4130,7 +4205,7 @@ def run_visual_set_expand_state(
             )
             context.emit(
                 "info",
-                f"局部 OCR 检测到“{current_match.text}”，区域已经{target_state}，本次不点击",
+                f"局部 OCR 检测到“{current_match.text}”，区域已经{target_state}，本次不点击；{visual_map_label(candidates[0] if candidates else None)}",
                 None,
             )
             return {
@@ -4166,7 +4241,7 @@ def run_visual_set_expand_state(
                 if desired_match is not None:
                     context.emit(
                         "info",
-                        f"局部 OCR 已确认区域切换为{target_state}状态",
+                        f"局部 OCR 已确认区域切换为{target_state}状态；{visual_map_label(candidates[0] if candidates else None)}",
                         None,
                     )
                     return {
@@ -4185,14 +4260,14 @@ def run_visual_set_expand_state(
 
             if last_source_match is not None:
                 raise WorkflowExecutionError(
-                    f"已点击状态文字，但局部 OCR 仍检测到“{source_text}”，未确认切换为{target_state}状态"
+                    f"已点击状态文字，但局部 OCR 仍检测到“{source_text}”，未确认切换为{target_state}状态；{visual_map_label(candidates[0] if candidates else None)}"
                 )
             raise WorkflowExecutionError(
-                f"已点击状态文字，但局部 OCR 未识别到“{desired_text}”，无法确认区域已经{target_state}"
+                f"已点击状态文字，但局部 OCR 未识别到“{desired_text}”，无法确认区域已经{target_state}；{visual_map_label(candidates[0] if candidates else None)}"
             )
 
     raise WorkflowExecutionError(
-        f"局部 OCR 未识别到“{collapsed_text}”或“{expanded_text}”，未执行点击"
+        f"局部 OCR 未识别到“{collapsed_text}”或“{expanded_text}”，未执行点击；{visual_map_label(candidates[0] if candidates else None)}"
     )
 
 
@@ -4235,7 +4310,7 @@ def run_visual_hover_object(
     if point is None:
         context.emit(
             "info",
-            f"视觉地图未找到悬浮对象“{target_name}”，刷新当前页面后再次视觉识别",
+            f"视觉地图未找到悬浮对象“{target_name}”，刷新当前页面后再次视觉识别；{visual_map_label(context.state.get('last_visual_resolved_map'))}",
             None,
         )
         point = visual_text_point(
@@ -4248,7 +4323,7 @@ def run_visual_hover_object(
         )
     if point is None:
         raise WorkflowExecutionError(
-            f"完整 OCR 页面布局中仍未找到悬浮对象“{target_name}”，未执行悬浮"
+            f"完整 OCR 页面布局中仍未找到悬浮对象“{target_name}”，未执行悬浮；{visual_map_label(context.state.get('last_visual_resolved_map'))}"
         )
     locator_mode = "visual-map"
     mouse.move(coords=point)
@@ -4266,6 +4341,7 @@ def run_visual_hover_object(
         "locatorMode": locator_mode,
         "hoverPage": hover_page,
         "layoutPath": str(visual_map_path(hover_map["signature"])),
+        "mapLabel": visual_map_label(hover_map),
         "visibleTextCount": len(hover_items),
     }
 

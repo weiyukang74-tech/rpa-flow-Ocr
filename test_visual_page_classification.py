@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import unittest
+import json
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -12,7 +15,10 @@ from ocr_marker import OcrItem
 from rpa_modules import (
     choose_visual_text_match,
     classify_visual_page,
+    existing_visual_map_path,
+    legacy_visual_map_path,
     run_visual_set_expand_state,
+    visual_map_path,
 )
 from workflow_engine import WorkflowExecutionError
 
@@ -28,6 +34,42 @@ class VisualPageClassificationTests(unittest.TestCase):
             emit=lambda *_args: None,
         )
 
+    def test_visual_map_folder_name_is_readable_and_safe(self) -> None:
+        signature = {
+            "page": "门诊/查询",
+            "windowTitle": "医院系统:患者查询?",
+            "stateFingerprint": "abcdef1234567890",
+        }
+        folder = visual_map_path(signature).parent.name
+        self.assertIn("页面-门诊-查询", folder)
+        self.assertIn("窗口-医院系统-患者查询", folder)
+        self.assertIn("状态-abcdef123456", folder)
+        self.assertNotIn("/", folder)
+        self.assertNotIn(":", folder)
+        self.assertNotIn("?", folder)
+
+    def test_legacy_visual_map_is_migrated_to_readable_folder(self) -> None:
+        signature = {
+            "page": "current-page",
+            "windowTitle": "医院系统",
+            "stateFingerprint": "abcdef1234567890",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch("rpa_modules.VISUAL_MAP_ROOT", Path(temporary)):
+                legacy = legacy_visual_map_path(signature)
+                legacy.parent.mkdir(parents=True)
+                legacy.write_text(
+                    json.dumps({"signature": signature}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                legacy.with_name("reference.png").write_bytes(b"reference")
+
+                migrated = existing_visual_map_path(signature)
+
+                self.assertEqual(migrated, visual_map_path(signature))
+                self.assertTrue(migrated.is_file())
+                self.assertTrue(migrated.with_name("reference.png").is_file())
+                self.assertFalse(legacy.parent.exists())
     def test_set_expand_state_clicks_once_and_verifies_result(self) -> None:
         context = self.make_expand_context()
         collapsed = OcrItem("更多v", 0.98, 45, 45, 75, 58)

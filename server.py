@@ -6,6 +6,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import sys
 import threading
 import uuid
@@ -31,8 +32,10 @@ ROOT = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
-WEB_ROOT = ROOT / "web"
+BUNDLE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+WEB_ROOT = BUNDLE_ROOT / "web"
 CONFIG_ROOT = ROOT / "configs"
+BUNDLED_CONFIG_ROOT = BUNDLE_ROOT / "configs"
 DEFAULT_CONFIG_PATH = CONFIG_ROOT / "default.json"
 CUSTOM_MODULES_PATH = CONFIG_ROOT / "custom-modules.json"
 HOST = "127.0.0.1"
@@ -45,6 +48,18 @@ RUN_MANAGER = RunManager(RUNNER)
 
 
 CONFIG_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+
+
+def initialize_runtime_files() -> None:
+    """Create editable config files beside a frozen executable on first run."""
+
+    CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
+    if BUNDLED_CONFIG_ROOT.resolve() == CONFIG_ROOT.resolve():
+        return
+    for bundled_path in BUNDLED_CONFIG_ROOT.glob("*.json"):
+        target_path = CONFIG_ROOT / bundled_path.name
+        if not target_path.exists():
+            shutil.copy2(bundled_path, target_path)
 
 
 def config_path(config_id: str) -> Path:
@@ -315,10 +330,20 @@ class StudioHandler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
+    initialize_runtime_files()
     if not DEFAULT_CONFIG_PATH.is_file():
         raise RuntimeError(f"缺少默认配置：{DEFAULT_CONFIG_PATH}")
     read_config()
+
+    if os.getenv("RPA_STUDIO_OCR_SELF_TEST") == "1":
+        from PIL import Image
+
+        from ocr_marker import create_ocr_engine, run_ocr
+
+        engine = create_ocr_engine()
+        run_ocr(engine, Image.new("RGB", (320, 120), "white"))
+        print("OCR self-test passed.")
+        return 0
 
     address = (HOST, PORT)
     httpd = ThreadingHTTPServer(address, StudioHandler)

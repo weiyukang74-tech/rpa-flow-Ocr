@@ -1,0 +1,10 @@
+mss>=9,<11
+onnxruntime==1.12.1
+openpyxl>=3.1,<4
+Pillow>=9,<11
+pywinauto>=0.6.8,<0.7
+rapidocr==2.0.6
+numpy==1.23.5
+opencv-python==4.5.5.64
+shapely==1.8.5.post1
+pyinstaller>=5.13,<6

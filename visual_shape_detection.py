@@ -592,7 +592,7 @@ def detect_table_regions(image: Image.Image) -> list[dict[str, Any]]:
     # Result tables may contain only one data row. Their vertical separators
     # are still repeated across many columns, but are much shorter than a large
     # scrolling grid, so do not require a 6.5% window-height span.
-    minimum_span = max(42, round(rgb.height * 0.035))
+    minimum_span = max(24, round(rgb.height * 0.02))
     raw_lines: list[tuple[int, int, int]] = []
 
     # Calculate all adjacent-column colour differences in native code. The old
@@ -689,16 +689,34 @@ def detect_table_regions(image: Image.Image) -> list[dict[str, Any]]:
             max(0, top - 2) + int(offset)
             for offset in np.flatnonzero(row_coverages >= 0.45)
         ]
+        strong_raw_row_lines = [
+            max(0, top - 2) + int(offset)
+            for offset in np.flatnonzero(row_coverages >= 0.82)
+        ]
         row_lines: list[int] = []
         for row_y in raw_row_lines:
             if not row_lines or row_y > row_lines[-1] + 2:
                 row_lines.append(row_y)
             else:
                 row_lines[-1] = round((row_lines[-1] + row_y) / 2)
+        strong_row_lines: list[int] = []
+        for row_y in strong_raw_row_lines:
+            if not strong_row_lines or row_y > strong_row_lines[-1] + 2:
+                strong_row_lines.append(row_y)
+            else:
+                strong_row_lines[-1] = round((strong_row_lines[-1] + row_y) / 2)
         # Navigation bars can also contain repeated vertical separators, but
         # they normally have only a top and a bottom border. A data grid needs
         # at least one internal horizontal separator as additional evidence.
-        if len(row_lines) < 3:
+        header_only_grid = (
+            len(row_lines) >= 2
+            and len(strong_row_lines) >= 2
+            and len(cluster) >= 6
+            and right - left >= rgb.width * 0.35
+            and 18 <= bottom - top <= 64
+            and top >= rgb.height * 0.12
+        )
+        if (len(row_lines) < 3 or bottom - top < 42) and not header_only_grid:
             continue
         if any(existing["bounds"] == bounds for existing in tables):
             continue
@@ -708,6 +726,7 @@ def detect_table_regions(image: Image.Image) -> list[dict[str, Any]]:
                 "bounds": bounds,
                 "columnLines": [line["x"] for line in cluster],
                 "rowLines": row_lines,
+                "headerOnly": header_only_grid,
                 "confidence": round(min(1.0, len(cluster) / 8), 3),
             }
         )

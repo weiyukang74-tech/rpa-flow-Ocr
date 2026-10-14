@@ -15,6 +15,7 @@ import ctypes
 import http.cookiejar
 import json
 import os
+import sys
 import time
 import traceback
 import urllib.error
@@ -50,7 +51,10 @@ def enable_dpi_awareness() -> None:
 # 必须在导入 pywinauto 和 mss 之前设置 DPI awareness。
 enable_dpi_awareness()
 
-from mss import MSS
+try:
+    from mss import MSS
+except ImportError:
+    from mss.windows import MSS
 from PIL import Image
 from pywinauto import Desktop, mouse
 from pywinauto.controls.hwndwrapper import HwndWrapper
@@ -59,7 +63,12 @@ from pywinauto.keyboard import send_keys
 
 WINDOW_TITLE = os.getenv("HIS_WINDOW_TITLE", "医院信息系统（HIS）")
 HIS_URL = os.getenv("HIS_URL", "http://127.0.0.1:51321").rstrip("/")
-OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+APP_ROOT = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+OUTPUT_DIR = APP_ROOT / "output"
 HOSPITALIZATION_NUMBER = os.getenv(
     "HIS_HOSPITALIZATION_NUMBER", "ZY26031245"
 ).strip()

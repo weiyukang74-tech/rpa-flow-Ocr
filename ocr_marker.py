@@ -104,9 +104,28 @@ def create_ocr_engine() -> Any:
         from rapidocr import RapidOCR
     except ImportError as exc:
         raise RuntimeError(
-            "缺少 OCR 依赖。请先在运行本脚本的虚拟环境中执行：\n"
-            "    pip install rapidocr onnxruntime"
+            "OCR 运行库加载失败。此 EXE 已内置 OCR，无需安装 Python 或执行 pip。\n"
+            f"底层错误：{type(exc).__name__}: {exc}"
         ) from exc
+
+    # RapidOCR 2.0.x passes pathlib.Path objects to older ONNX Runtime
+    # releases. Those releases only accept strings, so normalize the model
+    # path before the engine is constructed. This keeps the Windows 7 build
+    # on the last ONNX Runtime generation that does not require newer APIs.
+    try:
+        from rapidocr.inference_engine import onnxruntime as rapidocr_ort
+
+        original_session = rapidocr_ort.InferenceSession
+        if not getattr(original_session, "_rpa_path_compatible", False):
+            def compatible_session(path_or_bytes: Any, *args: Any, **kwargs: Any) -> Any:
+                if isinstance(path_or_bytes, Path):
+                    path_or_bytes = str(path_or_bytes)
+                return original_session(path_or_bytes, *args, **kwargs)
+
+            compatible_session._rpa_path_compatible = True
+            rapidocr_ort.InferenceSession = compatible_session
+    except (ImportError, AttributeError):
+        pass
 
     # 默认配置已经包含中英文检测和识别模型。
     try:
@@ -154,6 +173,13 @@ def parse_ocr_result(
 
     if boxes is not None and texts is not None and scores is not None:
         rows: Iterable[tuple[Any, Any, Any]] = zip(boxes, texts, scores)
+    elif any(value is not None for value in (boxes, texts, scores)) or hasattr(
+        result, "to_json"
+    ):
+        # RapidOCR 3.x returns a RapidOCROutput dataclass.  An empty OCR
+        # result legitimately has one or more of boxes/txts/scores set to
+        # None; it must be treated as no rows rather than iterated as a list.
+        rows = ()
     else:
         raw = result
         if isinstance(result, tuple) and len(result) == 2:
@@ -186,11 +212,219 @@ def parse_ocr_result(
     return items
 
 
+def visual_text_segments(
+    image: Image.Image,
+    item: OcrItem,
+) -> list[tuple[int, int, int, int]]:
+    """Split a suspiciously wide OCR line at large visual text gaps."""
+
+    text = normalize_ocr_text(item.text)
+    width = item.right - item.left
+    height = item.bottom - item.top
+    if len(text) < 6 or height < 8 or width < max(80, height * 5):
+        return []
+
+    padding_y = max(2, round(height * 0.15))
+    crop_left = max(0, item.left)
+    crop_top = max(0, item.top - padding_y)
+    crop_right = min(image.width, item.right)
+    crop_bottom = min(image.height, item.bottom + padding_y)
+    if crop_right <= crop_left or crop_bottom <= crop_top:
+        return []
+
+    pixels = np.asarray(
+        image.crop((crop_left, crop_top, crop_right, crop_bottom)).convert("RGB"),
+        dtype=np.int16,
+    )
+    background = np.median(pixels.reshape(-1, 3), axis=0)
+    color_distance = np.max(np.abs(pixels - background), axis=2)
+    active_columns = (
+        np.count_nonzero(color_distance >= 28, axis=0)
+        >= max(2, round(pixels.shape[0] * 0.10))
+    )
+    active_indexes = np.flatnonzero(active_columns)
+    if active_indexes.size < 2:
+        return []
+
+    first_active = int(active_indexes[0])
+    last_active = int(active_indexes[-1]) + 1
+    minimum_gap = max(7, round(height * 0.45))
+    gaps: list[tuple[int, int]] = []
+    gap_start: int | None = None
+    for column in range(first_active, last_active):
+        if not active_columns[column] and gap_start is None:
+            gap_start = column
+        elif active_columns[column] and gap_start is not None:
+            if column - gap_start >= minimum_gap:
+                gaps.append((gap_start, column))
+            gap_start = None
+    if gap_start is not None and last_active - gap_start >= minimum_gap:
+        gaps.append((gap_start, last_active))
+    if not gaps:
+        return []
+
+    cuts = [(left + right) // 2 for left, right in gaps]
+    local_ranges: list[tuple[int, int]] = []
+    start = first_active
+    for cut in cuts:
+        local_ranges.append((start, cut))
+        start = cut
+    local_ranges.append((start, last_active))
+    minimum_segment_width = max(14, round(height * 1.15))
+    if (
+        len(local_ranges) < 2
+        or len(local_ranges) > 8
+        or any(right - left < minimum_segment_width for left, right in local_ranges)
+    ):
+        return []
+
+    return [
+        (
+            crop_left + left,
+            item.top,
+            crop_left + right,
+            item.bottom,
+        )
+        for left, right in local_ranges
+    ]
+
+
+def partition_ocr_text(item: OcrItem, widths: Sequence[int]) -> list[str]:
+    raw_parts = [
+        normalize_ocr_text(part)
+        for part in re.split(r"\s+", item.raw_text.strip())
+        if normalize_ocr_text(part)
+    ]
+    if len(raw_parts) == len(widths):
+        return raw_parts
+
+    text = normalize_ocr_text(item.text)
+    if len(text) < len(widths):
+        return []
+    total_width = max(1, sum(widths))
+    boundaries = [0]
+    for index in range(1, len(widths)):
+        target = round(sum(widths[:index]) * len(text) / total_width)
+        target = max(boundaries[-1] + 1, target)
+        target = min(len(text) - (len(widths) - index), target)
+        boundaries.append(target)
+    boundaries.append(len(text))
+    return [
+        text[boundaries[index] : boundaries[index + 1]]
+        for index in range(len(widths))
+    ]
+
+
+def merge_segment_items(items: Sequence[OcrItem]) -> OcrItem:
+    ordered = sorted(items, key=lambda item: (item.left, item.top))
+    merged_text = normalize_ocr_text(ordered[0].text)
+    merged_raw = ordered[0].raw_text or ordered[0].text
+    for item in ordered[1:]:
+        next_text = normalize_ocr_text(item.text)
+        overlap = 0
+        for size in range(min(len(merged_text), len(next_text)), 0, -1):
+            if merged_text[-size:] == next_text[:size]:
+                overlap = size
+                break
+        merged_text += next_text[overlap:]
+        merged_raw += next_text[overlap:]
+    return OcrItem(
+        text=merged_text,
+        score=min(item.score for item in ordered),
+        left=min(item.left for item in ordered),
+        top=min(item.top for item in ordered),
+        right=max(item.right for item in ordered),
+        bottom=max(item.bottom for item in ordered),
+        raw_text=merged_raw,
+    )
+
+
+def split_merged_ocr_items(
+    engine: Any,
+    image: Image.Image,
+    items: Sequence[OcrItem],
+    min_score: float,
+    use_cls: bool,
+) -> list[OcrItem]:
+    split_items: list[OcrItem] = []
+    for item in items:
+        segments = visual_text_segments(image, item)
+        if not segments:
+            split_items.append(item)
+            continue
+
+        recognized: list[OcrItem] = []
+        for left, top, right, bottom in segments:
+            padding_x = max(1, round((bottom - top) * 0.12))
+            crop_left = max(0, left - padding_x)
+            crop_right = min(image.width, right + padding_x)
+            crop_top = max(0, top - 2)
+            crop_bottom = min(image.height, bottom + 2)
+            crop = image.crop((crop_left, crop_top, crop_right, crop_bottom))
+            local_items = run_ocr(
+                engine,
+                crop,
+                min_score=min_score,
+                use_cls=use_cls,
+                split_merged=False,
+            )
+            if not local_items:
+                recognized = []
+                break
+            recognized.append(
+                merge_segment_items(
+                    [
+                        OcrItem(
+                            text=local.text,
+                            score=local.score,
+                            left=local.left + crop_left,
+                            top=local.top + crop_top,
+                            right=local.right + crop_left,
+                            bottom=local.bottom + crop_top,
+                            raw_text=local.raw_text,
+                        )
+                        for local in local_items
+                    ]
+                )
+            )
+
+        original_text = normalize_ocr_text(item.text)
+        recognized_text = "".join(
+            normalize_ocr_text(candidate.text) for candidate in recognized
+        )
+        if (
+            len(recognized) >= 2
+            and SequenceMatcher(None, original_text, recognized_text).ratio() >= 0.55
+        ):
+            split_items.extend(recognized)
+            continue
+
+        widths = [right - left for left, _top, right, _bottom in segments]
+        parts = partition_ocr_text(item, widths)
+        if len(parts) != len(segments):
+            split_items.append(item)
+            continue
+        split_items.extend(
+            OcrItem(
+                text=part,
+                score=item.score,
+                left=left,
+                top=top,
+                right=right,
+                bottom=bottom,
+                raw_text=part,
+            )
+            for part, (left, top, right, bottom) in zip(parts, segments)
+        )
+    return split_items
+
+
 def run_ocr(
     engine: Any,
     image_source: Path | Image.Image | np.ndarray,
     min_score: float = OCR_MIN_SCORE,
     use_cls: bool = False,
+    split_merged: bool = True,
 ) -> list[OcrItem]:
     """Run OCR in memory with an adaptive scale for desktop UI text."""
 
@@ -226,7 +460,16 @@ def run_ocr(
         # Compatibility with older RapidOCR releases that accept ndarray input
         # but do not expose call-time thresholds.
         result = engine(input_array)
-    return parse_ocr_result(result, scale, min_score)
+    items = parse_ocr_result(result, scale, min_score)
+    if not split_merged:
+        return items
+    return split_merged_ocr_items(
+        engine,
+        image,
+        items,
+        min_score,
+        use_cls,
+    )
 
 
 def locate_table_title(

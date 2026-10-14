@@ -1,6 +1,13 @@
 .venv/
+.build-venv-win7/
+.python38/
+python38-installer.exe
+.build-venv/
+build/
+dist/
 __pycache__/
 .pycache/
+.pytest_cache/
 output/*
 !output/.gitkeep
 configs/workflow-*.json

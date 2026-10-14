@@ -8,7 +8,13 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
-from ocr_marker import OcrItem, find_header_matches, parse_ocr_result, run_ocr
+from ocr_marker import (
+    OcrItem,
+    find_header_matches,
+    parse_ocr_result,
+    run_ocr,
+    visual_text_segments,
+)
 
 
 def item(text: str, left: int, top: int, width: int = 70) -> OcrItem:
@@ -74,6 +80,16 @@ class OcrConfigurationTests(unittest.TestCase):
         self.assertEqual(len(weak_items), 1)
         self.assertEqual(weak_items[0].text, "模糊字段")
 
+    def test_empty_rapidocr_output_is_not_iterated(self) -> None:
+        result = SimpleNamespace(
+            boxes=None,
+            txts=None,
+            scores=None,
+            to_json=lambda: None,
+        )
+
+        self.assertEqual(parse_ocr_result(result, 1.0), [])
+
     def test_ocr_runs_in_memory_with_adaptive_scale_and_threshold(self) -> None:
         calls = []
 
@@ -96,6 +112,34 @@ class OcrConfigurationTests(unittest.TestCase):
         self.assertFalse(calls[0][1]["use_cls"])
         self.assertEqual(items[0].left, 10)
         self.assertEqual(items[0].right, 40)
+
+    def test_wide_navigation_text_is_split_at_large_visual_gaps(self) -> None:
+        image = Image.new("RGB", (340, 44), (0, 126, 190))
+        pixels = np.asarray(image).copy()
+        cursor = 12
+        group_bounds = []
+        for character_count in (6, 4, 6):
+            group_left = cursor
+            for _ in range(character_count):
+                pixels[12:32, cursor : cursor + 7] = 255
+                cursor += 10
+            group_bounds.append((group_left, cursor - 3))
+            cursor += 15
+        image = Image.fromarray(pixels)
+        merged = OcrItem(
+            "工伤标志查询系统配置医保住院登记",
+            0.98,
+            group_bounds[0][0],
+            12,
+            group_bounds[-1][1],
+            32,
+        )
+
+        segments = visual_text_segments(image, merged)
+
+        self.assertEqual(len(segments), 3)
+        self.assertLess(segments[0][2], segments[1][0] + 2)
+        self.assertLess(segments[1][2], segments[2][0] + 2)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,40 @@
 http://127.0.0.1:8765
 ```
 
+当前构建默认适用于 Windows 8.1/10/11。若目标电脑是 Windows 7 或出现
+`api-ms-win-core-path-l1-1-0.dll` 缺失提示，请在联网的构建电脑上运行：
+
+```text
+build-exe-win7.cmd
+```
+
+它使用 Python 3.8、旧版 ONNX Runtime 和 PyInstaller 5 生成兼容 Windows 7
+的版本，并覆盖 `dist\RPA流程配置器.exe`。目标电脑需要是 64 位 Windows 7
+SP1 或更新版本；32 位 Windows 不能运行此版本。
+
+## 打包为单个 EXE
+
+构建电脑安装 64 位 Python 3.10 后，双击：
+
+```text
+build-exe.cmd
+```
+
+脚本会创建独立的 `.build-venv` 构建环境并生成：
+
+```text
+dist\RPA流程配置器.exe
+```
+
+将这个 EXE 复制到其他 64 位 Windows 10/11 电脑即可运行，不需要安装
+Python，也不需要联网。首次运行会在 EXE 同目录创建可编辑的 `configs`
+目录；运行截图和 OCR 结果会写入同目录的 `output`。因此请把 EXE 放在
+当前用户有写入权限的普通文件夹中，不要直接放入 `Program Files`。
+
+该程序会操作当前登录用户桌面的鼠标、键盘和窗口，所以不能作为 Windows
+服务运行；目标电脑仍需保持已登录且未锁屏。单文件 EXE 首次启动时需要解压
+OCR 运行库，启动时间会比源码模式稍长。
+
 启动脚本不依赖固定盘符、目标系统项目目录或外部虚拟环境。首次运行时会在流程配置器目录创建 `.venv` 并根据 `requirements.txt` 安装依赖；以后移动整个独立项目文件夹仍可直接启动。需要预先安装 Python 3.10 或更高版本，并在首次安装依赖时连接网络。联网安装默认使用清华 PyPI 镜像 `https://pypi.tuna.tsinghua.edu.cn/simple` 加速下载。
 
 如果目标电脑不能联网，可以把预先下载的离线安装包放入 `rpa-flow-studio\wheelhouse`，启动程序会优先从该目录安装依赖。
@@ -90,10 +124,13 @@ Map，原有历史 Map 继续保留。
 页面模型保存在：
 
 ```text
-configs\visual-maps\page-<页面指纹>\
+configs\visual-maps\页面-<视觉页面>__窗口-<窗口名>__状态-<状态指纹>__配置-<短码>\
   layout.json
   reference.png
 ```
+
+Map 目录名现在直接包含视觉页面标识、窗口名、状态指纹和短校验码，便于人工区分。
+旧版本的 `page-<哈希>` 目录仍可读取；首次匹配到旧 Map 时会自动迁移为新目录名。
 
 `layout.json` 将可靠控件保存在 `visualCandidates`，将低置信度 OCR 文字、
 非标准轮廓以及因表格或弹窗上下文被排除的控件保存在 `weakCandidates`。
